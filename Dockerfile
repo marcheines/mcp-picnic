@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install dependencies with cache-friendly layering
 COPY package*.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
+RUN npm ci --ignore-scripts
 
 FROM deps AS build
 WORKDIR /app
@@ -19,7 +19,7 @@ ARG APP_UID=1638
 
 # Runtime dependency install only
 COPY package*.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --ignore-scripts
+RUN npm ci --omit=dev --ignore-scripts
 
 # Copy production artifacts
 COPY --from=build /app/dist ./dist
