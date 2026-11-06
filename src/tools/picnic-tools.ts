@@ -1307,8 +1307,9 @@ toolRegistry.register({
   description:
     "Get the rows of recipes on the start page of the Picnic app's recipe tab, e.g. recipes to " +
     "order again, featured or personal recommendations, as the app shows them. Each row has a " +
-    "title and recipes (id, name, subtitle, tags such as cooking time). Optionally filter rows " +
-    "by title. Use the recipe id with picnic_get_recipe or picnic_get_recipe_ingredients.",
+    "title, the selected filter (e.g. 'Nochmal bestellen') and recipes (id, name, subtitle, " +
+    "tags such as cooking time). Optionally filter rows by title or filter. Use the recipe id " +
+    "with picnic_get_recipe or picnic_get_recipe_ingredients.",
   inputSchema: z.object({
     section: z
       .string()
@@ -1316,8 +1317,9 @@ toolRegistry.register({
       .min(1)
       .optional()
       .describe(
-        "Only rows whose title contains this text (case-insensitive), e.g. 'Nochmal'. " +
-          "Omit for all rows; the response always lists all row titles.",
+        "Only rows whose title or selected filter contains this text (case-insensitive), " +
+          "e.g. 'Nochmal' for the 'Nochmal bestellen' filter of the 'Favoriten' row. Omit " +
+          "for all rows; the response always lists all rows with their filters.",
       ),
   }),
   annotations: { readOnlyHint: true, openWorldHint: true },
@@ -1328,13 +1330,19 @@ toolRegistry.register({
     const base = recipeImageBaseUrl(client)
     const allSections = overview.sections ?? []
     const filter = args.section?.toLocaleLowerCase("de")
+    // The app shows one filter (pill) per row, e.g. "Nochmal bestellen" in the "Favoriten" row.
+    const matches = (text: string | null | undefined) =>
+      Boolean(filter && text?.toLocaleLowerCase("de").includes(filter))
     const sections = filter
-      ? allSections.filter((section) => section.title?.toLocaleLowerCase("de").includes(filter))
+      ? allSections.filter((section) => matches(section.title) || matches(section.pill))
       : allSections
 
     return {
       ...(args.section && { section_filter: args.section }),
-      section_titles: allSections.map((section) => section.title),
+      rows: allSections.map((section) => ({
+        title: section.title,
+        ...(section.pill && { filter: section.pill }),
+      })),
       sections: sections.map((section) => ({
         title: section.title,
         ...(section.pill && { filter: section.pill }),

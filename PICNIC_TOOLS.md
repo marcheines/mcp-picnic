@@ -264,7 +264,7 @@ source URL).
 
 **Parameters:**
 
-- `section` (string, optional): Only rows whose title contains this text (case-insensitive)
+- `section` (string, optional): Only rows whose title or selected filter contains this text (case-insensitive), e.g. `Nochmal` for the "Nochmal bestellen" filter of the "Favoriten" row
 
 #### `picnic_get_saved_recipes`
 

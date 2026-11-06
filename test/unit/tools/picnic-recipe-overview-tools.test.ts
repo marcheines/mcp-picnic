@@ -47,8 +47,8 @@ describe("picnic_get_recipe_overview", () => {
     mocks.getRecipeOverview.mockResolvedValue({
       sections: [
         {
-          title: "Nochmal bestellen",
-          pill: null,
+          title: "Favoriten",
+          pill: "Nochmal bestellen",
           recipes: [
             summary("6299c215cd9ca8295124570c", "Hähnchen in Spinat-Parmesan-Sahne", {
               subtitle: "mit Tagliatelle",
@@ -73,10 +73,14 @@ describe("picnic_get_recipe_overview", () => {
     const toolRegistry = await loadTools()
     const result = parseToolResult(await toolRegistry.executeTool("picnic_get_recipe_overview", {}))
 
-    expect(result.section_titles).toEqual(["Nochmal bestellen", "Diese Woche"])
+    expect(result.rows).toEqual([
+      { title: "Favoriten", filter: "Nochmal bestellen" },
+      { title: "Diese Woche", filter: "Für dich" },
+    ])
     expect(result.sections).toEqual([
       {
-        title: "Nochmal bestellen",
+        title: "Favoriten",
+        filter: "Nochmal bestellen",
         recipes: [
           {
             recipeId: "6299c215cd9ca8295124570c",
@@ -104,14 +108,18 @@ describe("picnic_get_recipe_overview", () => {
     ])
   })
 
-  it("filters rows by title but still lists every title", async () => {
+  it("filters rows by the selected filter or the title, still listing every row", async () => {
     const toolRegistry = await loadTools()
-    const result = parseToolResult(
+    const byFilter = parseToolResult(
       await toolRegistry.executeTool("picnic_get_recipe_overview", { section: "nochmal" }),
     )
+    const byTitle = parseToolResult(
+      await toolRegistry.executeTool("picnic_get_recipe_overview", { section: "WOCHE" }),
+    )
 
-    expect(result.section_filter).toBe("nochmal")
-    expect(result.sections.map((s: { title: string }) => s.title)).toEqual(["Nochmal bestellen"])
-    expect(result.section_titles).toHaveLength(2)
+    expect(byFilter.section_filter).toBe("nochmal")
+    expect(byFilter.sections.map((s: { title: string }) => s.title)).toEqual(["Favoriten"])
+    expect(byFilter.rows).toHaveLength(2)
+    expect(byTitle.sections.map((s: { title: string }) => s.title)).toEqual(["Diese Woche"])
   })
 })
