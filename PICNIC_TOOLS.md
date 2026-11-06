@@ -256,6 +256,16 @@ Fetch a Picnic recipe by URL or recipe ID.
 
 - `recipe_url_or_id` (string): A Picnic recipe URL or 24-/32-character recipe ID
 
+#### `picnic_get_recipe_overview`
+
+Get the rows of recipes on the start page of the app's recipe tab (e.g. recipes to order again,
+featured recipes), each with title and recipes (ID, name, subtitle, tags, cooking time, image and
+source URL).
+
+**Parameters:**
+
+- `section` (string, optional): Only rows whose title contains this text (case-insensitive)
+
 #### `picnic_get_saved_recipes`
 
 List recipes saved in the user's Picnic cookbook.
@@ -302,7 +312,7 @@ the first change; if a step fails, the error lists the steps already done. Not i
 - `note` (string, optional): New note; an empty string deletes it
 - `add_ingredients` (array, optional): `{ product_id, quantity }` to add
 - `update_ingredients` (array, optional): `{ product_id, quantity }` new package count
-- `replace_ingredients` (array, optional): `{ product_id, new_product_id, quantity? }`, keeps the position
+- `replace_ingredients` (array, optional): `{ product_id, new_product_id, quantity? }`; Picnic lists the new product last
 - `remove_ingredients` (array of product IDs, optional)
 
 If the recipe is in the cart, only quantity changes reach the cart; add the recipe again for

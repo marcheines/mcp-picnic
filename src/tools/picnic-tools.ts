@@ -927,7 +927,10 @@ const updateRecipeInputSchema = z.object({
       }),
     )
     .optional()
-    .describe("Swap ingredients for other products, keeping their position in the list."),
+    .describe(
+      "Swap ingredients for other products. Picnic lists the new product at the end of the " +
+        "ingredients.",
+    ),
   remove_ingredients: z
     .array(productIdSchema)
     .optional()
@@ -1293,6 +1296,59 @@ toolRegistry.register({
       suggestion.referenceImage,
     )
     return { message: "Suggested image set", recipeId, imageId: suggestion.id }
+  },
+})
+
+// Recipe home page (the app's recipe tab), with rows such as "Nochmal bestellen"
+toolRegistry.register({
+  name: "picnic_get_recipe_overview",
+  description:
+    "Get the rows of recipes on the start page of the Picnic app's recipe tab, e.g. recipes to " +
+    "order again, featured or personal recommendations, as the app shows them. Each row has a " +
+    "title and recipes (id, name, subtitle, tags such as cooking time). Optionally filter rows " +
+    "by title. Use the recipe id with picnic_get_recipe or picnic_get_recipe_ingredients.",
+  inputSchema: z.object({
+    section: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe(
+        "Only rows whose title contains this text (case-insensitive), e.g. 'Nochmal'. " +
+          "Omit for all rows; the response always lists all row titles.",
+      ),
+  }),
+  annotations: { readOnlyHint: true, openWorldHint: true },
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const overview = await client.recipe.getRecipeOverview()
+    const base = recipeImageBaseUrl(client)
+    const allSections = overview.sections ?? []
+    const filter = args.section?.toLocaleLowerCase("de")
+    const sections = filter
+      ? allSections.filter((section) => section.title?.toLocaleLowerCase("de").includes(filter))
+      : allSections
+
+    return {
+      ...(args.section && { section_filter: args.section }),
+      section_titles: allSections.map((section) => section.title),
+      sections: sections.map((section) => ({
+        title: section.title,
+        ...(section.pill && { filter: section.pill }),
+        recipes: (section.recipes ?? []).map((recipe) => ({
+          recipeId: recipe.id,
+          name: recipe.name,
+          ...(recipe.subtitle && { subtitle: recipe.subtitle }),
+          ...(recipe.tags?.length && { tags: recipe.tags }),
+          ...(recipe.cookingTimeMinutes != null && {
+            cookingTimeMinutes: recipe.cookingTimeMinutes,
+          }),
+          ...(recipe.imageId && { imageUrl: `${base}/${recipe.imageId}/large.png` }),
+          sourceUrl: buildRecipeSourceUrl(config.PICNIC_COUNTRY_CODE, recipe.id),
+        })),
+      })),
+    }
   },
 })
 

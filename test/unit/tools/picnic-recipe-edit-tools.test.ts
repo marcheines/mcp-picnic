@@ -155,7 +155,7 @@ describe("picnic_update_recipe", () => {
     }
     expect(mocks.updateRecipeIngredient).toHaveBeenCalledWith(ID, "ing-s1", selection)
     expect(mocks.updateRecipeIngredientInCart).toHaveBeenCalledWith(ID, "ing-s1", selection)
-    // the replacement keeps the old position and quantity
+    // the replacement keeps the old quantity (Picnic may ignore the requested position)
     expect(mocks.addUserDefinedRecipeIngredient).toHaveBeenNthCalledWith(1, ID, "s9", {
       quantity: 1,
       portions: 4,
