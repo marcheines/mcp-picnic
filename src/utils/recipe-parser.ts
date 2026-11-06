@@ -184,6 +184,13 @@ const INSTRUCTION_HEADER_RE =
   /^(zubereitung(sschritte)?|anleitung|so wird.?s gemacht|bereiding(swijze)?|zo maak je het|pr[eé]paration|instructions?)$/i
 const STEP_LABEL_RE = /^(schritt|stap|[ée]tape|step)\s*\d+$/i
 const TIP_HEADER_RE = /^(tipps?|tips?|astuces?)$/i
+/**
+ * The app's note editor ("Notiz hinzufügen…") follows the last step on the recipe page,
+ * followed by the recipe name. Steps and tips end there; otherwise that text is appended
+ * to the last step.
+ */
+const NOTE_EDITOR_RE =
+  /^(notiz hinzuf(ü|ue)gen|notitie toevoegen|ajouter une note|add (a )?note)\b/i
 const TIME_RE = /\b\d+\s*min\b/i
 const TOTAL_TIME_RE = /\b(gesamt|insgesamt|total|totaal)\b/i
 const SERVINGS_RE = /\b(portion(en|s)?|porties|personen|personnes?)\b|\b\d+\s*pers\b/i
@@ -415,6 +422,7 @@ export function parseSellingGroupRecipe(page: unknown, opts: ParseRecipeOptions 
       const body: string[] = []
       for (let k = si + 1; k < next; k++) {
         const t = tokens[k]
+        if (NOTE_EDITOR_RE.test(t)) break
         if (
           STEP_LABEL_RE.test(t) ||
           SERVINGS_RE.test(t) ||
@@ -430,7 +438,7 @@ export function parseSellingGroupRecipe(page: unknown, opts: ParseRecipeOptions 
   } else if (instructionStart >= 0) {
     for (let k = instructionStart + 1; k < tokens.length; k++) {
       const t = tokens[k]
-      if (TIP_HEADER_RE.test(t)) break
+      if (TIP_HEADER_RE.test(t) || NOTE_EDITOR_RE.test(t)) break
       if (
         SERVINGS_RE.test(t) ||
         NUMBER_ONLY_RE.test(t) ||
@@ -447,6 +455,7 @@ export function parseSellingGroupRecipe(page: unknown, opts: ParseRecipeOptions 
   if (tipStart >= 0) {
     for (let k = tipStart + 1; k < tokens.length; k++) {
       const t = tokens[k]
+      if (NOTE_EDITOR_RE.test(t)) break
       if (t.length >= 2 && !BUTTON_WORDS.has(t.toLowerCase())) result.tips.push(t)
     }
   }

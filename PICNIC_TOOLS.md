@@ -133,7 +133,14 @@ Clear all items from the shopping cart.
 
 #### `picnic_get_delivery_slots`
 
-Get available delivery time slots.
+Get delivery time slots and the selected slot.
+
+**Parameters:**
+
+- `available_only` (boolean, optional): Only slots that can still be booked (default: true); the selected slot is always included
+- `date` (string, optional): Only slots on this local date (`YYYY-MM-DD`)
+
+**Returns:** The selected slot, the matching slots (ID, window, order deadline, availability, green choice, minimum order value in cents) and the counts with and without filters.
 
 #### `picnic_set_delivery_slot`
 
@@ -150,6 +157,9 @@ Get past and current deliveries.
 **Parameters:**
 
 - `filter` (array of strings, optional): Filter deliveries by status
+- `limit` / `offset` (number, optional): Pagination
+
+**Returns:** ID, status, creation time, delivery window, number of orders and total price in cents per delivery. Use `picnic_get_delivery` for the products.
 
 #### `picnic_get_delivery`
 
@@ -158,6 +168,8 @@ Get details of a specific delivery.
 **Parameters:**
 
 - `deliveryId` (string): The ID of the delivery to get details for
+
+**Returns:** Status, window, totals, returned containers and per order the products (same shape as the cart lines), amount paid and payment type. Amounts in cents.
 
 #### `picnic_get_delivery_position`
 

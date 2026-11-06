@@ -71,6 +71,77 @@ const CART_MUTATION_ANNOTATIONS = {
 } as const
 
 type PicnicCart = PicnicClient.Types.cart.Cart
+type PicnicCartLine = PicnicClient.Types.cart.CartLineItem
+type PicnicDelivery = PicnicClient.Types.delivery.Delivery
+
+/**
+ * Reduces a cart or order line to what an LLM needs. In picnic-api 5 every line holds one
+ * product; it is reported as an order line with one article, the shape of the 4.x version.
+ */
+function toLineSummary(line: PicnicCartLine) {
+  const quantity = line.quantity ?? 1
+  return {
+    order_line_id: line.id,
+    // Line price in cents, after discounts (all units of the product together).
+    price: line.displayPrice,
+    ...(line.originalPrice != null && { original_price: line.originalPrice }),
+    articles: [
+      {
+        product_id: line.productId,
+        name: line.name,
+        unit: line.unitQuantity,
+        // Price per unit in cents. How many units are in the cart matters to callers: it is
+        // what they check when a mutation failed ambiguously (see mutateCart).
+        price: quantity > 0 ? Math.round(line.displayPrice / quantity) : line.displayPrice,
+        quantity,
+        ...(line.imageId && { image_id: line.imageId }),
+      },
+    ],
+    ...(line.labels?.length && {
+      labels: line.labels.map((label) => label.text).filter(Boolean),
+    }),
+    ...(line.isUnavailable && {
+      unavailable: true,
+      ...(line.unavailableReason && { unavailable_reason: line.unavailableReason }),
+    }),
+    ...(line.recipeId && { recipe_id: line.recipeId }),
+  }
+}
+
+/**
+ * Reduces a picnic-api 5 delivery to what an LLM needs: per order the products (in the same
+ * shape as the cart), totals and payment type. Amounts are in cents.
+ */
+export function filterDeliveryData(delivery: PicnicDelivery) {
+  return {
+    id: delivery.id,
+    status: delivery.status,
+    window_start: delivery.windowStart,
+    window_end: delivery.windowEnd,
+    total_price: delivery.totalPrice,
+    total_count: delivery.totalCount,
+    ...(delivery.promotionSavings ? { total_savings: delivery.promotionSavings } : {}),
+    ...(delivery.depositTotal ? { deposit_total: delivery.depositTotal } : {}),
+    ...(delivery.returnedContainers?.length && {
+      returned_containers: delivery.returnedContainers.map((container) => ({
+        name: container.name,
+        quantity: container.quantity,
+        refund: container.price,
+      })),
+    }),
+    cancellable: delivery.cancellable,
+    orders: (delivery.orders ?? []).map((order) => ({
+      order_id: order.id,
+      status: order.status,
+      created: order.creationTime,
+      items: (order.items ?? []).map(toLineSummary),
+      // Amount paid for the order, including deposits and fees.
+      total_price: order.checkoutTotalPrice,
+      ...(order.promotionSavings ? { total_savings: order.promotionSavings } : {}),
+      ...(order.payment?.paymentType && { payment_type: order.payment.paymentType }),
+    })),
+  }
+}
 
 /**
  * Reduces the picnic-api 5 cart model to what an LLM needs.
@@ -82,35 +153,7 @@ type PicnicCart = PicnicClient.Types.cart.Cart
 export function filterCartData(cart: PicnicCart | null | undefined) {
   if (!cart || typeof cart !== "object") return cart
 
-  const items = (cart.items ?? []).map((line) => {
-    const quantity = line.quantity ?? 1
-    return {
-      order_line_id: line.id,
-      // Line price in cents, after discounts (all units of the product together).
-      price: line.displayPrice,
-      ...(line.originalPrice != null && { original_price: line.originalPrice }),
-      articles: [
-        {
-          product_id: line.productId,
-          name: line.name,
-          unit: line.unitQuantity,
-          // Price per unit in cents. How many units are in the cart matters to callers: it is
-          // what they check when a mutation failed ambiguously (see mutateCart).
-          price: quantity > 0 ? Math.round(line.displayPrice / quantity) : line.displayPrice,
-          quantity,
-          ...(line.imageId && { image_id: line.imageId }),
-        },
-      ],
-      ...(line.labels?.length && {
-        labels: line.labels.map((label) => label.text).filter(Boolean),
-      }),
-      ...(line.isUnavailable && {
-        unavailable: true,
-        ...(line.unavailableReason && { unavailable_reason: line.unavailableReason }),
-      }),
-      ...(line.recipeId && { recipe_id: line.recipeId }),
-    }
-  })
+  const items = (cart.items ?? []).map(toLineSummary)
 
   return {
     id: cart.id,
@@ -1146,15 +1189,63 @@ toolRegistry.register({
 })
 
 // Get delivery slots tool
+const deliverySlotsInputSchema = z.object({
+  available_only: z
+    .boolean()
+    .default(true)
+    .describe(
+      "Only slots that can still be booked (default: true). The selected slot is always included.",
+    ),
+  date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "Expected a date like 2026-11-09")
+    .optional()
+    .describe("Only slots on this local delivery date (YYYY-MM-DD)."),
+})
+
 toolRegistry.register({
   name: "picnic_get_delivery_slots",
-  description: "Get available delivery time slots",
-  inputSchema: z.object({}),
-  handler: async () => {
+  description:
+    "Get delivery time slots and the currently selected slot. By default only slots that can " +
+    "still be booked; optionally for one day. Times are local with UTC offset, amounts in cents.",
+  inputSchema: deliverySlotsInputSchema,
+  annotations: { readOnlyHint: true, openWorldHint: true },
+  handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const slots = await client.cart.getDeliverySlots()
-    return slots
+    const result = await client.cart.getDeliverySlots()
+    const availableOnly = args.available_only ?? true
+
+    const slots = (result.slots ?? []).filter(
+      (slot) =>
+        (!availableOnly || slot.isAvailable || slot.isSelected) &&
+        // windowStart is local time with offset, e.g. 2026-11-09T15:00:00.000+01:00
+        (!args.date || slot.windowStart.startsWith(args.date)),
+    )
+
+    return {
+      filters: { available_only: availableOnly, ...(args.date && { date: args.date }) },
+      selected_slot: result.selectedSlot
+        ? {
+            slot_id: result.selectedSlot.slotId,
+            window_start: result.selectedSlot.windowStart,
+            window_end: result.selectedSlot.windowEnd,
+            explicitly_selected: result.selectedSlot.isExplicitSelection,
+          }
+        : null,
+      slots: slots.map((slot) => ({
+        slot_id: slot.slotId,
+        window_start: slot.windowStart,
+        window_end: slot.windowEnd,
+        order_deadline: slot.cutOffTime,
+        available: slot.isAvailable,
+        ...(slot.isSelected && { selected: true }),
+        ...(slot.isGreenChoice && { green_choice: true }),
+        ...(slot.minimumOrderValue != null && { minimum_order_value: slot.minimumOrderValue }),
+      })),
+      total: slots.length,
+      total_unfiltered: result.slots?.length ?? 0,
+    }
   },
 })
 
@@ -1209,7 +1300,19 @@ toolRegistry.register({
     // Apply pagination
     const startIndex = args.offset || 0
     const limit = args.limit || 10
-    const paginatedDeliveries = allDeliveries.slice(startIndex, startIndex + limit)
+    // Picnic's summary leaves the item count at 0, so it is left out; picnic_get_delivery has
+    // the products.
+    const paginatedDeliveries = allDeliveries
+      .slice(startIndex, startIndex + limit)
+      .map((delivery) => ({
+        id: delivery.id,
+        status: delivery.status,
+        creationTime: delivery.creationTime,
+        windowStart: delivery.windowStart,
+        windowEnd: delivery.windowEnd,
+        orderCount: delivery.orderCount,
+        totalPrice: delivery.totalPrice,
+      }))
 
     return {
       deliveries: paginatedDeliveries,
@@ -1237,7 +1340,7 @@ toolRegistry.register({
     await ensureClientInitialized()
     const client = getPicnicClient()
     const delivery = await client.delivery.getDelivery(args.deliveryId)
-    return delivery
+    return filterDeliveryData(delivery)
   },
 })
 

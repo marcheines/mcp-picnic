@@ -142,6 +142,51 @@ describe("parseSellingGroupRecipe", () => {
     expect(r.tips).toEqual(["Dazu passt ein Salat."])
   })
 
+  it("ends the last step and the tips at the app's note editor", () => {
+    const structured = [
+      { selling_group_title_section_data: { name: "Broccoli-Nudelauflauf" } },
+      { portions: 4 },
+    ]
+    const withoutTips = parseSellingGroupRecipe(
+      detailPage(
+        [
+          "Broccoli-Nudelauflauf",
+          "Zutaten",
+          "**Broccoli** 1 Stk.",
+          "So wird's gemacht",
+          "Schritt 1",
+          "Broccoli garen.",
+          "Schritt 2",
+          "Im Ofen überbacken.",
+          "Notiz Hinzufügen...",
+          "Broccoli-Nudelauflauf",
+        ],
+        structured,
+      ),
+      { imageBaseUrl: IMAGE_BASE },
+    )
+    expect(withoutTips.instructions).toEqual(["Broccoli garen.", "Im Ofen überbacken."])
+
+    const withTips = parseSellingGroupRecipe(
+      detailPage(
+        [
+          "Broccoli-Nudelauflauf",
+          "So wird's gemacht",
+          "Schritt 1",
+          "Broccoli garen.",
+          "Tipp",
+          "Passt auch mit Lauch.",
+          "Notiz hinzufügen",
+          "Broccoli-Nudelauflauf",
+        ],
+        structured,
+      ),
+      { imageBaseUrl: IMAGE_BASE },
+    )
+    expect(withTips.instructions).toEqual(["Broccoli garen."])
+    expect(withTips.tips).toEqual(["Passt auch mit Lauch."])
+  })
+
   it("parses Dutch and French recipes via localized headers and step labels", () => {
     const nl = detailPage(
       ["Ingrediënten", "**Rijst** 200 g", "Bereiding", "4 porties", "Stap 1", "Kook de rijst."],
