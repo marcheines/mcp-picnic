@@ -38,14 +38,30 @@ Search for products in Picnic.
 
 #### `picnic_get_promotions`
 
-Get Picnic's current weekly promotions/deals from the app's "Alle acties" page.
+Get Picnic's current promotions/deals from the app's promotions page (via picnic-api's
+`catalog.getPromotions`).
 
 **Parameters:**
 
-- `limit` (number, optional): Maximum number of promotions to return (1-100, default: 25)
-- `offset` (number, optional): Number of promotions to skip for pagination (default: 0)
+- `section` (string, optional): Only sections whose title contains this text (case-insensitive), e.g. `Fleisch`
+- `include_groups` (boolean, optional): Include promotion groups (default: true)
+- `limit` (number, optional): Maximum number of promoted products to return (1-100, default: 25)
+- `offset` (number, optional): Number of promoted products to skip for pagination (default: 0)
 
-**Returns:** Promoted products with product ID, promotion ID, name, current price, unit, promotion label, original price when shown, image ID, and pagination metadata.
+**Returns:** The page's sections (title, product and group counts); promoted products, each listed
+once, with product ID, name, brand, current price, original price, promotion label, unit, unit
+price, section and image ID (prices in cents); promotion groups (deals on several products) with
+their group ID; and pagination metadata.
+
+#### `picnic_get_promotion_group`
+
+List the products of a promotion group, e.g. "20% auf Alpro".
+
+**Parameters:**
+
+- `group_id` (string, required): Group ID from `promotion_groups` of `picnic_get_promotions`
+
+**Returns:** Group ID, name and its products with the same fields as `picnic_get_promotions`.
 
 #### `picnic_get_suggestions`
 

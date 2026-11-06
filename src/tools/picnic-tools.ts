@@ -146,106 +146,6 @@ export function filterCartData(cart: PicnicCart | null | undefined) {
   }
 }
 
-type UnknownRecord = Record<string, unknown>
-
-interface PicnicPromotionProduct {
-  product_id: string
-  promotion_id: string
-  name: string
-  price: number
-  unit?: string
-  promotion_label?: string
-  original_price?: number
-  image_id?: string
-  max_count?: number
-}
-
-function isRecord(value: unknown): value is UnknownRecord {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value))
-}
-
-function getRecordProperty(record: UnknownRecord, key: string): UnknownRecord | null {
-  const value = record[key]
-  return isRecord(value) ? value : null
-}
-
-function getPromotionContext(tile: UnknownRecord): UnknownRecord | null {
-  const analytics = getRecordProperty(tile, "analytics")
-  const contexts = analytics?.contexts
-  if (!Array.isArray(contexts)) return null
-
-  for (const context of contexts) {
-    if (!isRecord(context)) continue
-    const data = getRecordProperty(context, "data")
-    if (typeof data?.promotion_id === "string") return data
-  }
-
-  return null
-}
-
-function toPromotionProduct(tile: UnknownRecord): PicnicPromotionProduct | null {
-  const content = getRecordProperty(tile, "content")
-  const sellingUnit = content ? getRecordProperty(content, "sellingUnit") : null
-  const promotion = getPromotionContext(tile)
-
-  if (!sellingUnit || !promotion) return null
-  if (typeof sellingUnit.id !== "string" || typeof sellingUnit.name !== "string") return null
-  if (typeof promotion.promotion_id !== "string") return null
-
-  const price =
-    typeof promotion.price === "number"
-      ? promotion.price
-      : typeof sellingUnit.display_price === "number"
-        ? sellingUnit.display_price
-        : null
-  if (price === null) return null
-
-  return {
-    product_id: sellingUnit.id,
-    promotion_id: promotion.promotion_id,
-    name: sellingUnit.name,
-    price,
-    ...(typeof sellingUnit.unit_quantity === "string" && { unit: sellingUnit.unit_quantity }),
-    ...(typeof promotion.promotion_label === "string" && {
-      promotion_label: promotion.promotion_label,
-    }),
-    ...(typeof promotion.strikethrough_price === "number" &&
-      promotion.show_strikethrough_price !== false && {
-        original_price: promotion.strikethrough_price,
-      }),
-    ...(typeof sellingUnit.image_id === "string" && { image_id: sellingUnit.image_id }),
-    ...(typeof sellingUnit.max_count === "number" && { max_count: sellingUnit.max_count }),
-  }
-}
-
-function extractPromotionsFromPage(page: unknown): PicnicPromotionProduct[] {
-  const promotions: PicnicPromotionProduct[] = []
-  const seen = new Set<string>()
-
-  const visit = (node: unknown): void => {
-    if (Array.isArray(node)) {
-      for (const child of node) visit(child)
-      return
-    }
-
-    if (!isRecord(node)) return
-
-    const promotion = toPromotionProduct(node)
-    if (promotion) {
-      const key = `${promotion.product_id}:${promotion.promotion_id}`
-      if (!seen.has(key)) {
-        seen.add(key)
-        promotions.push(promotion)
-      }
-    }
-
-    for (const value of Object.values(node)) visit(value)
-  }
-
-  visit(page)
-  return promotions
-}
-
 // Search products tool
 const searchInputSchema = z.object({
   query: z.string().describe("Search query for products"),
@@ -313,44 +213,107 @@ toolRegistry.register({
 })
 
 // Weekly promotions/deals tool
+type PicnicProductTile = PicnicClient.Types.catalog.ProductTile
+
+/** The promotion text of a product tile, e.g. "1+1 gratis": the PROMO label, else the first label. */
+function promotionLabel(tile: PicnicProductTile): string | undefined {
+  const labels = tile.labels ?? []
+  const label = labels.find((l) => l.type === "PROMO" && l.text) ?? labels.find((l) => l.text)
+  return label?.text ?? undefined
+}
+
+/** Reduces a promoted product tile to what an LLM needs. Prices are in cents. */
+function toPromotionProduct(tile: PicnicProductTile, section?: string) {
+  const label = promotionLabel(tile)
+  return {
+    product_id: tile.id,
+    name: tile.name,
+    ...(tile.brand && { brand: tile.brand }),
+    price: tile.displayPrice,
+    ...(tile.originalPrice != null && { original_price: tile.originalPrice }),
+    ...(label && { promotion_label: label }),
+    ...(tile.unitQuantity && { unit: tile.unitQuantity }),
+    ...(tile.unitPrice && { unit_price: tile.unitPrice }),
+    ...(section && { section }),
+    ...(tile.isUnavailable && { unavailable: true }),
+    ...(tile.imageId && { image_id: tile.imageId }),
+  }
+}
+
 const promotionsInputSchema = z.object({
+  section: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe(
+      "Only promotions from sections whose title contains this text (case-insensitive), " +
+        "e.g. 'Fleisch' or 'Molkerei'. Omit for all sections; the response lists the sections.",
+    ),
+  include_groups: z
+    .boolean()
+    .default(true)
+    .describe(
+      "Include promotion groups (deals on several products, e.g. '20% auf Alpro'). " +
+        "List their products with picnic_get_promotion_group.",
+    ),
   limit: z
     .number()
     .min(1)
     .max(100)
     .default(25)
-    .describe("Maximum number of promotions to return (1-100, default: 25)"),
+    .describe("Maximum number of promoted products to return (1-100, default: 25)"),
   offset: z
     .number()
     .min(0)
     .default(0)
-    .describe("Number of promotions to skip for pagination (default: 0)"),
+    .describe("Number of promoted products to skip for pagination (default: 0)"),
 })
 
 toolRegistry.register({
   name: "picnic_get_promotions",
   description:
-    "Get Picnic's current weekly promotions/deals from the app's 'Alle acties' page. " +
-    "Returns promoted products with current price, promotion label, original price when shown, " +
-    "and pagination.",
+    "Get Picnic's current promotions/deals from the app's promotions page. Returns promoted " +
+    "products (current price, original price, promotion label, section), the page's sections, " +
+    "and promotion groups (deals on several products). Prices are in cents. Optionally filter " +
+    "by section title.",
   inputSchema: promotionsInputSchema,
+  annotations: { readOnlyHint: true, openWorldHint: true },
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const page = await client.sendRequest("GET", "/pages/promo-page-all-promos-redirect", null, {
-      includePicnicHeaders: true,
-    })
-    const allPromotions = extractPromotionsFromPage(page)
+    const page = await client.catalog.getPromotions()
+    const allSections = page.sections ?? []
+
+    const filter = args.section?.toLocaleLowerCase("de")
+    const sections = filter
+      ? allSections.filter((section) => section.title?.toLocaleLowerCase("de").includes(filter))
+      : allSections
+
+    // A product can be shown in several sections (e.g. personal promotions and its category);
+    // list it once, under the first section it appears in.
+    const seen = new Set<string>()
+    const allPromotions = sections.flatMap((section) =>
+      (section.products ?? [])
+        .filter((tile) => {
+          if (seen.has(tile.id)) return false
+          seen.add(tile.id)
+          return true
+        })
+        .map((tile) => toPromotionProduct(tile, section.title)),
+    )
 
     const startIndex = args.offset ?? 0
     const limit = args.limit ?? 25
     const promotions = allPromotions.slice(startIndex, startIndex + limit)
 
     return {
-      source: {
-        pageId: "promo-page-all-promos-redirect",
-        endpoint: "/pages/promo-page-all-promos-redirect",
-      },
+      ...(args.section && { section_filter: args.section }),
+      sections: allSections.map((section) => ({
+        title: section.title,
+        products: section.products?.length ?? 0,
+        groups: section.groups?.length ?? 0,
+      })),
       promotions,
       pagination: {
         offset: startIndex,
@@ -359,6 +322,47 @@ toolRegistry.register({
         total: allPromotions.length,
         hasMore: startIndex + limit < allPromotions.length,
       },
+      ...((args.include_groups ?? true) && {
+        promotion_groups: sections.flatMap((section) =>
+          (section.groups ?? []).map((group) => ({
+            group_id: group.id,
+            name: group.name,
+            ...(group.label && { promotion_label: group.label }),
+            ...(group.example && { example: group.example }),
+            section: section.title,
+          })),
+        ),
+      }),
+    }
+  },
+})
+
+// Products of a promotion group (a deal on several products)
+const promotionGroupInputSchema = z.object({
+  group_id: z
+    .string()
+    .trim()
+    .min(1)
+    .describe("Promotion group id from the promotion_groups list of picnic_get_promotions."),
+})
+
+toolRegistry.register({
+  name: "picnic_get_promotion_group",
+  description:
+    "List the products of a Picnic promotion group (a deal on several products, e.g. " +
+    "'20% auf Alpro'), with current and original prices in cents and the promotion label.",
+  inputSchema: promotionGroupInputSchema,
+  annotations: { readOnlyHint: true, openWorldHint: true },
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const group = await client.catalog.getPromotionGroup(args.group_id)
+    const products = (group.products ?? []).map((tile) => toPromotionProduct(tile))
+    return {
+      group_id: group.id,
+      name: group.name,
+      products,
+      total: products.length,
     }
   },
 })
