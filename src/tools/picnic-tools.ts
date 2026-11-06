@@ -964,7 +964,9 @@ toolRegistry.register({
   name: "picnic_update_recipe",
   description:
     "Edit an own recipe: rename it, change its default portions, replace or delete its note, " +
-    "and add, re-quantify, swap or remove ingredients (identified by product id). Everything is " +
+    "and add, re-quantify, swap or remove ingredients (identified by product id). Do not use it " +
+    "to work around products that are temporarily unavailable: the recipe keeps its original " +
+    "products, replacements belong in the cart. Everything is " +
     "checked before the first change; if a step fails, the result lists what was already done. " +
     "If the recipe is in the cart, the cart keeps its old ingredients except for quantity " +
     "changes; add the recipe to the cart again to pick up added or swapped products.",
@@ -1416,8 +1418,10 @@ toolRegistry.register({
   name: "picnic_add_recipe_to_cart",
   description:
     "Add a recipe's ingredients to the shopping cart by assigning the recipe (selling group) " +
-    "to the basket. Optionally set the number of portions. If this fails, call picnic_get_cart " +
-    "to check whether the ingredients landed before retrying.",
+    "to the basket. Optionally set the number of portions. The result lists ingredients that " +
+    "are not available for the selected delivery: replace those in the cart (picnic_search, " +
+    "picnic_add_to_cart, picnic_remove_from_cart) and leave the recipe itself unchanged. If " +
+    "this fails, call picnic_get_cart to check whether the ingredients landed before retrying.",
   inputSchema: addRecipeToCartInputSchema,
   annotations: CART_MUTATION_ANNOTATIONS,
   handler: async (args) => {
@@ -1434,10 +1438,32 @@ toolRegistry.register({
         { includePicnicHeaders: true },
       ),
     )
+    // Report what Picnic cannot deliver, so it can be replaced in the cart. Best effort: the
+    // recipe is in the cart already, so a failing check must not turn into an error.
+    let unavailable: Array<{ product_id: string; name: string; reason?: string }> | undefined
+    try {
+      const cart = await client.cart.getCart()
+      unavailable = (cart.items ?? [])
+        .filter((line) => line.recipeId === recipeId && line.isUnavailable)
+        .map((line) => ({
+          product_id: line.productId,
+          name: line.name,
+          ...(line.unavailableReason && { reason: line.unavailableReason }),
+        }))
+    } catch (error) {
+      console.error(`[add recipe to cart] availability check failed: ${getErrorMessage(error)}`)
+    }
+
     return {
       message: "Recipe added to cart",
       recipeId,
       ...(args.portions !== undefined && { portions: args.portions }),
+      ...(unavailable?.length && {
+        unavailable_ingredients: unavailable,
+        hint:
+          "These ingredients will not be delivered. Replace them in the cart with available " +
+          "products; keep the recipe's original ingredients.",
+      }),
     }
   },
 })

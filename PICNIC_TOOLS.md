@@ -371,6 +371,10 @@ Add a recipe's ingredients to the shopping cart by assigning the recipe selling 
 - `recipe_url_or_id` (string): A Picnic recipe URL or 24-/32-character recipe ID
 - `portions` (number, optional): Number of portions to add
 
+**Returns:** Confirmation and, if any, `unavailable_ingredients` (product ID, name, reason) that
+Picnic cannot deliver for the selected slot. Replace those in the cart; the recipe keeps its
+original ingredients.
+
 #### `picnic_remove_recipe_from_cart`
 
 Remove a recipe's ingredients from the shopping cart.

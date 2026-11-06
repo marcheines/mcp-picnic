@@ -6,12 +6,14 @@ const mocks = vi.hoisted(() => ({
   sendRequest: vi.fn(),
   createUserDefinedRecipe: vi.fn(),
   setUserDefinedRecipeNote: vi.fn(),
+  getCart: vi.fn(),
 }))
 
 vi.mock("../../../src/utils/picnic-client.js", () => ({
   getPicnicClient: () => ({
     url: "https://storefront-prod.de.picnicinternational.com/api/15",
     sendRequest: mocks.sendRequest,
+    cart: { getCart: mocks.getCart },
     recipe: {
       createUserDefinedRecipe: mocks.createUserDefinedRecipe,
       setUserDefinedRecipeNote: mocks.setUserDefinedRecipeNote,
@@ -34,6 +36,7 @@ describe("picnic_create_recipe", () => {
     mocks.initializePicnicClient.mockResolvedValue(undefined)
     mocks.createUserDefinedRecipe.mockResolvedValue({ sellingGroupId: OWN_RECIPE_ID })
     mocks.setUserDefinedRecipeNote.mockResolvedValue(undefined)
+    mocks.getCart.mockResolvedValue({ items: [] })
   })
 
   it("creates the recipe with portions, ingredients and an HTML note", async () => {
@@ -148,5 +151,57 @@ describe("picnic_create_recipe", () => {
       { payload: { selling_group_id: OWN_RECIPE_ID, portions: 2 } },
       { includePicnicHeaders: true },
     )
+    // nothing unavailable: no extra fields
+    expect(JSON.parse(result.content[0].text ?? "").unavailable_ingredients).toBeUndefined()
+  })
+
+  it("reports the recipe's unavailable ingredients after adding it", async () => {
+    const { toolRegistry } = await import("../../../src/tools/registry.js")
+    await import("../../../src/tools/picnic-tools.js")
+    mocks.sendRequest.mockResolvedValue({})
+    mocks.getCart.mockResolvedValue({
+      items: [
+        { productId: "s1", name: "Zwiebeln", recipeId: OWN_RECIPE_ID, isUnavailable: false },
+        {
+          productId: "s1052898",
+          name: "Ostmann Paprika edelsüß",
+          recipeId: OWN_RECIPE_ID,
+          isUnavailable: true,
+          unavailableReason: "Am 9. Nov nicht verfügbar",
+        },
+        // unavailable, but not part of this recipe
+        { productId: "s9", name: "Anderes", recipeId: null, isUnavailable: true },
+      ],
+    })
+
+    const result = JSON.parse(
+      (
+        await toolRegistry.executeTool("picnic_add_recipe_to_cart", {
+          recipe_url_or_id: OWN_RECIPE_ID,
+        })
+      ).content[0].text ?? "",
+    )
+
+    expect(result.unavailable_ingredients).toEqual([
+      {
+        product_id: "s1052898",
+        name: "Ostmann Paprika edelsüß",
+        reason: "Am 9. Nov nicht verfügbar",
+      },
+    ])
+    expect(result.hint).toMatch(/keep the recipe's original ingredients/)
+  })
+
+  it("still reports success when the availability check fails", async () => {
+    const { toolRegistry } = await import("../../../src/tools/registry.js")
+    await import("../../../src/tools/picnic-tools.js")
+    mocks.sendRequest.mockResolvedValue({})
+    mocks.getCart.mockRejectedValue(new Error("cart down"))
+
+    const result = await toolRegistry.executeTool("picnic_add_recipe_to_cart", {
+      recipe_url_or_id: OWN_RECIPE_ID,
+    })
+
+    expect(JSON.parse(result.content[0].text ?? "").message).toBe("Recipe added to cart")
   })
 })
