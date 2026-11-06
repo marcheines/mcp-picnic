@@ -185,6 +185,23 @@ describe("parseSellingGroupRecipe", () => {
     )
     expect(withTips.instructions).toEqual(["Broccoli garen."])
     expect(withTips.tips).toEqual(["Passt auch mit Lauch."])
+    // As on the live page: the marker shares the block with the last step, with a
+    // non-breaking space and a decomposed "ü".
+    const sameBlock = parseSellingGroupRecipe(
+      detailPage(
+        [
+          "Broccoli-Nudelauflauf",
+          "So wird's gemacht",
+          "Schritt 1",
+          "Broccoli garen.",
+          "Schritt 2",
+          "Wie wäre es mit Blumenkohl ? Notiz\u00a0Hinzufu\u0308gen... Broccoli-Nudelauflauf",
+        ],
+        structured,
+      ),
+      { imageBaseUrl: IMAGE_BASE },
+    )
+    expect(sameBlock.instructions).toEqual(["Broccoli garen.", "Wie wäre es mit Blumenkohl ?"])
   })
 
   it("parses Dutch and French recipes via localized headers and step labels", () => {
