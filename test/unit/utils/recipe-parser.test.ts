@@ -202,6 +202,50 @@ describe("parseSellingGroupRecipe", () => {
       { imageBaseUrl: IMAGE_BASE },
     )
     expect(sameBlock.instructions).toEqual(["Broccoli garen.", "Wie wäre es mit Blumenkohl ?"])
+    // Label and button as separate text elements, with a soft hyphen in the button.
+    const separate = parseSellingGroupRecipe(
+      detailPage(
+        [
+          "Broccoli-Nudelauflauf",
+          "So wird's gemacht",
+          "Schritt 1",
+          "Wie wäre es mit Blumenkohl ?",
+          "Notiz",
+          "Hinzu\u00adfügen...",
+          "Broccoli-Nudelauflauf",
+        ],
+        structured,
+      ),
+      { imageBaseUrl: IMAGE_BASE },
+    )
+    expect(separate.instructions).toEqual(["Wie wäre es mit Blumenkohl ?"])
+
+    // Only the repeated recipe name, without a recognizable note editor.
+    const nameOnly = parseSellingGroupRecipe(
+      detailPage(
+        ["Broccoli-Nudelauflauf", "So wird's gemacht", "Schritt 1", "Überbacken.", "Broccoli-Nudelauflauf"],
+        structured,
+      ),
+      { imageBaseUrl: IMAGE_BASE },
+    )
+    expect(nameOnly.instructions).toEqual(["Überbacken."])
+
+    // Steps that merely start with a verb like "Ajouter" or "Hinzufügen von" stay intact.
+    const verbs = parseSellingGroupRecipe(
+      detailPage(
+        [
+          "Broccoli-Nudelauflauf",
+          "So wird's gemacht",
+          "Schritt 1",
+          "Hinzufügen von Salz nach Geschmack.",
+          "Schritt 2",
+          "Ajouter le fromage.",
+        ],
+        structured,
+      ),
+      { imageBaseUrl: IMAGE_BASE },
+    )
+    expect(verbs.instructions).toEqual(["Hinzufügen von Salz nach Geschmack.", "Ajouter le fromage."])
   })
 
   it("parses Dutch and French recipes via localized headers and step labels", () => {

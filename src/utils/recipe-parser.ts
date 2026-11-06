@@ -191,17 +191,33 @@ const TIP_HEADER_RE = /^(tipps?|tips?|astuces?)$/i
  * non-breaking space, so it is searched anywhere in a token, on NFC-normalized text.
  */
 const NOTE_EDITOR_RE =
-  /(notiz\s+hinzuf(ü|ue)gen|notitie\s+toevoegen|ajouter\s+une\s+note|add\s+(a\s+)?note)/i
+  /(notiz\s*hinzuf(ü|ue)gen|notitie\s*toevoegen|ajouter\s+une\s+note|add\s+(a\s+)?note)/i
 
 /**
  * Splits a token at the note editor marker. Returns the text before it (trimmed, possibly
  * empty) and whether the marker was found.
  */
 function cutAtNoteEditor(token: string): { text: string; found: boolean } {
-  const normalized = token.normalize("NFC")
+  const normalized = normalizeForMatch(token)
+  if (NOTE_EDITOR_PART_RE.test(normalized)) return { text: "", found: true }
   const match = NOTE_EDITOR_RE.exec(normalized)
   if (!match) return { text: token, found: false }
   return { text: normalized.slice(0, match.index).trim(), found: true }
+}
+
+/**
+ * The note editor can also come as separate text elements: the label "Notiz" and the button
+ * "Hinzufügen...". Either one alone marks the end of the steps.
+ */
+const NOTE_EDITOR_PART_RE = /^(notiz|notitie|hinzuf(ü|ue)gen|toevoegen)\s*(\.{2,}|…)?$/i
+
+/** NFC-normalizes text, drops invisible characters and collapses whitespace. */
+function normalizeForMatch(text: string): string {
+  return text
+    .normalize("NFC")
+    .replace(/[\u00ad\u200b-\u200d\u2060\ufeff]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
 }
 const TIME_RE = /\b\d+\s*min\b/i
 const TOTAL_TIME_RE = /\b(gesamt|insgesamt|total|totaal)\b/i
@@ -425,6 +441,12 @@ export function parseSellingGroupRecipe(page: unknown, opts: ParseRecipeOptions 
     }
   }
 
+  // After the steps, the page repeats the recipe name (below the note editor). A step never
+  // consists of just the recipe name, so such a token ends the steps.
+  const recipeNameKey = result.name ? normalizeForMatch(result.name).toLowerCase() : null
+  const isRecipeName = (t: string) =>
+    recipeNameKey !== null && normalizeForMatch(t).toLowerCase() === recipeNameKey
+
   // Instructions: anchored on the "Schritt N" labels (robust); otherwise fall
   // back to the text after the instruction header, stopping at the tips block.
   if (stepIdx.length > 0) {
@@ -439,6 +461,7 @@ export function parseSellingGroupRecipe(page: unknown, opts: ParseRecipeOptions 
           if (t.length >= 2) body.push(t)
           break
         }
+        if (isRecipeName(t)) break
         if (
           STEP_LABEL_RE.test(t) ||
           SERVINGS_RE.test(t) ||
@@ -455,7 +478,7 @@ export function parseSellingGroupRecipe(page: unknown, opts: ParseRecipeOptions 
     for (let k = instructionStart + 1; k < tokens.length; k++) {
       const cut = cutAtNoteEditor(tokens[k])
       const t = cut.text
-      if (TIP_HEADER_RE.test(t)) break
+      if (TIP_HEADER_RE.test(t) || isRecipeName(t)) break
       if (cut.found) {
         if (t.length >= 2) result.instructions.push(t)
         break
@@ -477,6 +500,7 @@ export function parseSellingGroupRecipe(page: unknown, opts: ParseRecipeOptions 
     for (let k = tipStart + 1; k < tokens.length; k++) {
       const cut = cutAtNoteEditor(tokens[k])
       const t = cut.text
+      if (isRecipeName(t)) break
       if (t.length >= 2 && !BUTTON_WORDS.has(t.toLowerCase())) result.tips.push(t)
       if (cut.found) break
     }
