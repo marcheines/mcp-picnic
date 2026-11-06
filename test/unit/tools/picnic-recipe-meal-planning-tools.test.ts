@@ -4,10 +4,14 @@ import type { ToolResult } from "../../../src/tools/registry.js"
 const mocks = vi.hoisted(() => ({
   initializePicnicClient: vi.fn(),
   sendRequest: vi.fn(),
+  getRecipe: vi.fn(),
 }))
 
 vi.mock("../../../src/utils/picnic-client.js", () => ({
-  getPicnicClient: () => ({ sendRequest: mocks.sendRequest }),
+  getPicnicClient: () => ({
+    sendRequest: mocks.sendRequest,
+    recipe: { getRecipe: mocks.getRecipe },
+  }),
   initializePicnicClient: mocks.initializePicnicClient,
   saveSession: vi.fn(),
 }))
@@ -19,51 +23,67 @@ function parseToolResult(result: ToolResult) {
   return JSON.parse(result.content[0].text ?? "")
 }
 
-function recipePage(recipeId: string, recipeName: string) {
+/** A recipe as picnic-api 5 returns it (Recipe), with one core and one cupboard ingredient. */
+function recipeModel(recipeId: string, recipeName: string) {
   return {
-    body: [
+    id: recipeId,
+    name: recipeName,
+    portions: 2,
+    defaultPortions: 4,
+    ingredients: [
       {
-        type: "PML",
-        analytics: {
-          contexts: [
-            {
-              data: {
-                recipe_id: recipeId,
-                recipe_name: recipeName,
-                portions: 2,
-                selling_units: [
-                  {
-                    ingredient_id: `ingredient-${recipeId}`,
-                    selling_unit_id: `s-${recipeId}`,
-                    quantity: 2,
-                    checked: true,
-                  },
-                ],
-              },
-            },
-          ],
-        },
+        ingredientId: `ingredient-${recipeId}`,
+        name: `${recipeName} ingredient`,
+        sellingUnitId: `s-${recipeId}`,
+        quantity: 2,
+        checked: true,
+        type: "CORE",
+        isAvailable: true,
+        unitQuantity: "500 g",
+        neededText: "(400 g benötigt)",
+        price: 125,
       },
       {
-        type: "PML",
-        analytics: {
-          contexts: [
-            {
-              schema: "iglu:com.picnic/product/1-0-0",
-              data: { product_id: `s-${recipeId}` },
-            },
-          ],
-        },
-        pml: {
-          component: {
-            type: "STACK",
-            children: [
-              { type: "RICH_TEXT", markdown: `${recipeName} ingredient` },
-              { type: "RICH_TEXT", markdown: "500 g" },
-              { type: "RICH_TEXT", markdown: "€1,25" },
-            ],
-          },
-        },
+        ingredientId: `salt-${recipeId}`,
+        name: null,
+        sellingUnitId: "s-salt",
+        quantity: 1,
+        checked: false,
+        type: "CUPBOARD",
+        isAvailable: false,
+        unitQuantity: null,
+        neededText: null,
+        price: null,
+      },
+    ],
+  }
+}
+
+function expectedIngredients(recipeId: string, recipeName: string) {
+  return {
+    recipeId,
+    recipeName,
+    portions: 2,
+    ingredients: [
+      {
+        ingredientId: `ingredient-${recipeId}`,
+        sellingUnitId: `s-${recipeId}`,
+        name: `${recipeName} ingredient`,
+        packageInfo: "500 g",
+        priceCents: 125,
+        quantity: 2,
+        isPantryItem: false,
+        needed: "(400 g benötigt)",
+      },
+      {
+        ingredientId: `salt-${recipeId}`,
+        sellingUnitId: "s-salt",
+        name: "",
+        packageInfo: "",
+        priceCents: null,
+        quantity: 1,
+        isPantryItem: true,
+        unavailable: true,
       },
     ],
   }
@@ -82,42 +102,36 @@ describe("recipe meal-planning tools", () => {
     vi.clearAllMocks()
   })
 
-  it("fetches structured recipe ingredients by URL and requests the encoded selling-group page", async () => {
-    mocks.sendRequest.mockResolvedValue(recipePage(RECIPE_A, "Recipe A"))
+  it("reads recipe ingredients through picnic-api's getRecipe, with names resolved", async () => {
+    mocks.getRecipe.mockResolvedValue(recipeModel(RECIPE_A, "Recipe A"))
 
     const { toolRegistry } = await loadTools()
     const result = await toolRegistry.executeTool("picnic_get_recipe_ingredients", {
       recipe_url_or_id: `https://picnic.app/de/rezepte/${RECIPE_A}/recipe-a`,
     })
 
-    expect(mocks.sendRequest).toHaveBeenCalledWith(
-      "GET",
-      `/pages/selling-group-details-page?selling_group_id=${encodeURIComponent(RECIPE_A)}`,
-      null,
-      { includePicnicHeaders: true },
-    )
-    expect(parseToolResult(result)).toEqual({
-      recipeId: RECIPE_A,
-      recipeName: "Recipe A",
-      portions: 2,
-      ingredients: [
-        {
-          ingredientId: `ingredient-${RECIPE_A}`,
-          sellingUnitId: `s-${RECIPE_A}`,
-          name: "Recipe A ingredient",
-          packageInfo: "500 g",
-          priceCents: 125,
-          quantity: 2,
-          isPantryItem: false,
-        },
-      ],
+    expect(mocks.getRecipe).toHaveBeenCalledWith(RECIPE_A, { resolveIngredientNames: true })
+    expect(parseToolResult(result)).toEqual(expectedIngredients(RECIPE_A, "Recipe A"))
+  })
+
+  it("falls back to the recipe without name lookup when it fails", async () => {
+    mocks.getRecipe
+      .mockRejectedValueOnce(new Error("product page failed"))
+      .mockResolvedValueOnce(recipeModel(RECIPE_A, "Recipe A"))
+
+    const { toolRegistry } = await loadTools()
+    const result = await toolRegistry.executeTool("picnic_get_recipe_ingredients", {
+      recipe_url_or_id: RECIPE_A,
     })
+
+    expect(mocks.getRecipe).toHaveBeenNthCalledWith(2, RECIPE_A)
+    expect(parseToolResult(result).recipeName).toBe("Recipe A")
   })
 
   it("returns successes and per-input errors when fetching multiple recipe ingredients", async () => {
-    mocks.sendRequest.mockImplementation((method: string, path: string) => {
-      if (path.includes(RECIPE_B)) throw new Error("Recipe unavailable")
-      return recipePage(RECIPE_A, "Recipe A")
+    mocks.getRecipe.mockImplementation(async (recipeId: string) => {
+      if (recipeId === RECIPE_B) throw new Error("Recipe unavailable")
+      return recipeModel(RECIPE_A, "Recipe A")
     })
 
     const { toolRegistry } = await loadTools()
@@ -126,24 +140,7 @@ describe("recipe meal-planning tools", () => {
     })
 
     expect(parseToolResult(result)).toEqual({
-      recipes: [
-        {
-          recipeId: RECIPE_A,
-          recipeName: "Recipe A",
-          portions: 2,
-          ingredients: [
-            {
-              ingredientId: `ingredient-${RECIPE_A}`,
-              sellingUnitId: `s-${RECIPE_A}`,
-              name: "Recipe A ingredient",
-              packageInfo: "500 g",
-              priceCents: 125,
-              quantity: 2,
-              isPantryItem: false,
-            },
-          ],
-        },
-      ],
+      recipes: [expectedIngredients(RECIPE_A, "Recipe A")],
       errors: [{ input: RECIPE_B, error: "Recipe unavailable" }],
     })
   })

@@ -6,6 +6,10 @@ export interface RecipeIngredient {
   priceCents: number | null
   quantity: number
   isPantryItem: boolean
+  /** The amount the recipe needs as Picnic shows it, e.g. "(150 g benötigt)". */
+  needed?: string
+  /** True when the product can't be ordered at the moment. */
+  unavailable?: boolean
 }
 
 export interface StructuredRecipeIngredients {

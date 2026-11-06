@@ -1,5 +1,5 @@
 import { z } from "zod"
-import type PicnicClient from "picnic-api"
+import PicnicClient from "picnic-api"
 import { toolRegistry, mcpContent } from "./registry.js"
 import {
   getPicnicClient,
@@ -13,11 +13,8 @@ import {
   parseRecipeList,
   buildRecipeSourceUrl,
 } from "../utils/recipe-parser.js"
-import {
-  buildShoppingList,
-  findMealCombinations,
-  parseRecipeIngredients,
-} from "../utils/recipe-meal-planning.js"
+import { buildShoppingList, findMealCombinations } from "../utils/recipe-meal-planning.js"
+import type { StructuredRecipeIngredients } from "../utils/recipe-meal-planning.js"
 import { config } from "../config.js"
 
 type PicnicDeliveryStatus = PicnicClient.Types.cart.DeliveryStatus
@@ -463,9 +460,9 @@ toolRegistry.register({
 //
 // Picnic recipes are "selling groups". Recipe detail comes from
 // /pages/selling-group-details-page?selling_group_id=<id>, and the cookbook /
-// recipe overview from /pages/cookbook-page-content. These page routes are
-// called directly via sendRequest because the picnic-api recipe.* page methods
-// target outdated ids (recipe-details-page-root) that the API answers with 404.
+// recipe overview from /pages/cookbook-page-content. The listing and detail tools
+// still read these pages directly with their own parsers (checked against the live
+// API with picnic-api 5). The ingredient tools use picnic-api's recipe.getRecipe.
 
 // Base URL for recipe/product image derivatives, derived from the API URL, e.g.
 // https://storefront-prod.de.picnicinternational.com/static/images
@@ -927,15 +924,43 @@ async function fetchRecipeIngredientsByRef(
   recipeUrlOrId: string,
 ) {
   const recipeId = await resolveRecipeId(recipeUrlOrId)
-  const page = await client.sendRequest(
-    "GET",
-    `/pages/selling-group-details-page?selling_group_id=${encodeURIComponent(recipeId)}`,
-    null,
-    { includePicnicHeaders: true },
-  )
-  const parsed = parseRecipeIngredients(page)
-  if (!parsed) throw new Error(`Could not find recipe ingredient data for ${recipeId}`)
-  return parsed
+  // picnic-api 5 reads the recipe page the way the app shows it. Names missing from the
+  // ingredient tiles are looked up on the product pages; those extra requests can fail the
+  // call, so fall back to the recipe without them rather than failing outright.
+  let recipe: PicnicRecipe
+  try {
+    recipe = await client.recipe.getRecipe(recipeId, { resolveIngredientNames: true })
+  } catch (error) {
+    console.error(
+      `[recipe ingredients] name lookup failed for ${recipeId}, retrying without: ${getErrorMessage(error)}`,
+    )
+    recipe = await client.recipe.getRecipe(recipeId)
+  }
+  return toStructuredRecipeIngredients(recipe)
+}
+
+type PicnicRecipe = PicnicClient.Types.recipe.Recipe
+
+/** Maps the picnic-api 5 recipe model to the ingredient shape the meal-planning tools use. */
+function toStructuredRecipeIngredients(recipe: PicnicRecipe): StructuredRecipeIngredients {
+  return {
+    recipeId: recipe.id,
+    recipeName: recipe.name,
+    portions: recipe.portions,
+    ingredients: (recipe.ingredients ?? []).map((ingredient) => ({
+      ingredientId: ingredient.ingredientId,
+      sellingUnitId: ingredient.sellingUnitId,
+      name: ingredient.name ?? "",
+      packageInfo: ingredient.unitQuantity ?? "",
+      priceCents: ingredient.price,
+      quantity: ingredient.quantity,
+      // Not selected by default when adding the recipe to the cart: cupboard staples and
+      // long-keeping items (CUPBOARD / CORE_STOCKABLE).
+      isPantryItem: !ingredient.checked,
+      ...(ingredient.neededText && { needed: ingredient.neededText }),
+      ...(!ingredient.isAvailable && { unavailable: true }),
+    })),
+  }
 }
 
 function getErrorMessage(error: unknown): string {
@@ -1232,18 +1257,24 @@ toolRegistry.register({
 // Get delivery scenario tool
 toolRegistry.register({
   name: "picnic_get_delivery_scenario",
-  description: "Get driver and route information for a delivery",
+  description:
+    "Get driver and route information for a delivery that is on its way (not available for " +
+    "upcoming or completed deliveries).",
   inputSchema: deliveryInputSchema,
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const scenario = await client.sendRequest(
-      "GET",
-      `/deliveries/${encodeURIComponent(args.deliveryId)}/scenario`,
-      null,
-      { includePicnicHeaders: true },
-    )
-    return scenario
+    try {
+      return await client.delivery.getDeliveryRoute(args.deliveryId)
+    } catch (error) {
+      if (PicnicClient.isPicnicApiError(error) && error.status === 404) {
+        throw new Error(
+          `No driver/route information for delivery ${args.deliveryId}. Picnic only has it ` +
+            "while the delivery is on its way, not for upcoming or completed deliveries.",
+        )
+      }
+      throw error
+    }
   },
 })
 
@@ -1319,11 +1350,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const orderStatus = await client.sendRequest(
-      "GET",
-      `/cart/checkout/order/${encodeURIComponent(args.orderId)}/status`,
-    )
-    return orderStatus
+    return await client.checkout.getOrderStatus(args.orderId)
   },
 })
 
