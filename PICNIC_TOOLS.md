@@ -289,6 +289,53 @@ check `picnic_get_own_recipes` before retrying after an error.
   Each product may appear only once.
 - `note` (string, optional): Free-text note (max 5000 characters); each line becomes a paragraph
 
+#### `picnic_update_recipe`
+
+Edit an own recipe. Ingredients are identified by their product ID. Everything is validated before
+the first change; if a step fails, the error lists the steps already done. Not idempotent.
+
+**Parameters:**
+
+- `recipe_id` (string, required): Own-recipe ID (32 hex characters)
+- `name` (string, optional): New name (max 43 characters)
+- `portions` (number, optional): New default portions (quantities are not rescaled)
+- `note` (string, optional): New note; an empty string deletes it
+- `add_ingredients` (array, optional): `{ product_id, quantity }` to add
+- `update_ingredients` (array, optional): `{ product_id, quantity }` new package count
+- `replace_ingredients` (array, optional): `{ product_id, new_product_id, quantity? }`, keeps the position
+- `remove_ingredients` (array of product IDs, optional)
+
+If the recipe is in the cart, only quantity changes reach the cart; add the recipe again for
+added or swapped products.
+
+#### `picnic_delete_recipe`
+
+Permanently delete an own recipe. Removes it from the cart first, like the app.
+
+**Parameters:**
+
+- `recipe_id` (string, required): Own-recipe ID
+- `keep_in_cart` (boolean, optional): Leave its ingredients in the cart (default: false)
+
+#### `picnic_get_recipe_image_suggestions`
+
+List Picnic's suggested images for an own recipe, with preview URLs.
+
+**Parameters:**
+
+- `recipe_id` (string, required): Own-recipe ID
+
+#### `picnic_set_recipe_image`
+
+Set the image of an own recipe: a suggested image, or an own JPEG/PNG/WebP image (max 5 MB)
+downloaded from a public https URL and uploaded to Picnic.
+
+**Parameters:**
+
+- `recipe_id` (string, required): Own-recipe ID
+- `image_id` (string): A suggested image ID, or
+- `image_url` (string): Public https URL of an own image
+
 #### `picnic_save_recipe`
 
 Save a recipe to the user's Picnic cookbook.

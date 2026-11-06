@@ -78,8 +78,8 @@ type PicnicDelivery = PicnicClient.Types.delivery.Delivery
  * Reduces a cart or order line to what an LLM needs. In picnic-api 5 every line holds one
  * product; it is reported as an order line with one article, the shape of the 4.x version.
  */
-function toLineSummary(line: PicnicCartLine) {
-  const quantity = line.quantity ?? 1
+function toLineSummary(line: PicnicCartLine, quantityOverride?: number) {
+  const quantity = quantityOverride ?? line.quantity ?? 1
   return {
     order_line_id: line.id,
     // Line price in cents, after discounts (all units of the product together).
@@ -109,6 +109,24 @@ function toLineSummary(line: PicnicCartLine) {
 }
 
 /**
+ * Maps a list of cart or order lines, fixing the quantity of products that appear in more
+ * than one line (e.g. once on its own and once for a recipe). Picnic then reports the
+ * product's total count on every line; the line's own count is the number of unit ids it
+ * joins, e.g. "643_644" holds 2 units.
+ */
+function toLineSummaries(lines: PicnicCartLine[]) {
+  const linesPerProduct = new Map<string, number>()
+  for (const line of lines) {
+    linesPerProduct.set(line.productId, (linesPerProduct.get(line.productId) ?? 0) + 1)
+  }
+  return lines.map((line) =>
+    (linesPerProduct.get(line.productId) ?? 0) > 1
+      ? toLineSummary(line, String(line.id).split("_").filter(Boolean).length || 1)
+      : toLineSummary(line),
+  )
+}
+
+/**
  * Reduces a picnic-api 5 delivery to what an LLM needs: per order the products (in the same
  * shape as the cart), totals and payment type. Amounts are in cents.
  */
@@ -134,7 +152,7 @@ export function filterDeliveryData(delivery: PicnicDelivery) {
       order_id: order.id,
       status: order.status,
       created: order.creationTime,
-      items: (order.items ?? []).map(toLineSummary),
+      items: toLineSummaries(order.items ?? []),
       // Amount paid for the order, including deposits and fees.
       total_price: order.checkoutTotalPrice,
       ...(order.promotionSavings ? { total_savings: order.promotionSavings } : {}),
@@ -153,7 +171,7 @@ export function filterDeliveryData(delivery: PicnicDelivery) {
 export function filterCartData(cart: PicnicCart | null | undefined) {
   if (!cart || typeof cart !== "object") return cart
 
-  const items = (cart.items ?? []).map(toLineSummary)
+  const items = toLineSummaries(cart.items ?? [])
 
   return {
     id: cart.id,
@@ -837,6 +855,444 @@ toolRegistry.register({
     }
 
     return result
+  },
+})
+
+// Edit, delete and illustrate own (user-defined) recipes
+const OWN_RECIPE_ID_RE = /^[0-9a-f]{32}$/i
+
+const ownRecipeIdSchema = z
+  .string()
+  .trim()
+  .regex(
+    OWN_RECIPE_ID_RE,
+    "Expected a 32-character own-recipe id (from picnic_get_own_recipes or picnic_create_recipe)",
+  )
+  .describe("Id of an own recipe (32 hex characters), from picnic_get_own_recipes.")
+
+const productIdSchema = z
+  .string()
+  .regex(PICNIC_PRODUCT_ID_RE, "Expected a Picnic product id such as s1018231")
+
+const updateRecipeInputSchema = z.object({
+  recipe_id: ownRecipeIdSchema,
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .max(OWN_RECIPE_NAME_MAX)
+    .optional()
+    .describe(`New recipe name (max ${OWN_RECIPE_NAME_MAX} characters).`),
+  portions: z
+    .number()
+    .int()
+    .min(1)
+    .max(20)
+    .optional()
+    .describe("New default number of portions. Ingredient quantities are not rescaled."),
+  note: z
+    .string()
+    .max(OWN_RECIPE_NOTE_MAX)
+    .optional()
+    .describe("Replaces the note (plain text, each line a paragraph). An empty string deletes it."),
+  add_ingredients: z
+    .array(
+      z.object({
+        product_id: productIdSchema.describe("Picnic product id from picnic_search."),
+        quantity: z.number().int().min(1).default(1).describe("Number of packages."),
+      }),
+    )
+    .optional()
+    .describe("Products to add as new ingredients."),
+  update_ingredients: z
+    .array(
+      z.object({
+        product_id: productIdSchema.describe("Product id of an ingredient already in the recipe."),
+        quantity: z.number().int().min(1).describe("New number of packages."),
+      }),
+    )
+    .optional()
+    .describe("Change the package count of ingredients in the recipe."),
+  replace_ingredients: z
+    .array(
+      z.object({
+        product_id: productIdSchema.describe("Product id of an ingredient in the recipe."),
+        new_product_id: productIdSchema.describe("Product id to use instead, from picnic_search."),
+        quantity: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe("Number of packages of the new product (default: the old quantity)."),
+      }),
+    )
+    .optional()
+    .describe("Swap ingredients for other products, keeping their position in the list."),
+  remove_ingredients: z
+    .array(productIdSchema)
+    .optional()
+    .describe("Product ids of ingredients to remove from the recipe."),
+})
+
+type UpdateRecipeArgs = z.input<typeof updateRecipeInputSchema>
+
+/** Fails when the same product is targeted by more than one ingredient operation. */
+function assertDistinctIngredientTargets(args: UpdateRecipeArgs): void {
+  const targets = [
+    ...(args.update_ingredients ?? []).map((i) => i.product_id),
+    ...(args.replace_ingredients ?? []).map((i) => i.product_id),
+    ...(args.remove_ingredients ?? []),
+  ]
+  const added = [
+    ...(args.add_ingredients ?? []).map((i) => i.product_id),
+    ...(args.replace_ingredients ?? []).map((i) => i.new_product_id),
+  ]
+  for (const list of [targets, added]) {
+    const duplicates = list.filter((id, index) => list.indexOf(id) !== index)
+    if (duplicates.length > 0) {
+      throw new Error(
+        `Each product may appear in only one operation: ${[...new Set(duplicates)].join(", ")}`,
+      )
+    }
+  }
+}
+
+toolRegistry.register({
+  name: "picnic_update_recipe",
+  description:
+    "Edit an own recipe: rename it, change its default portions, replace or delete its note, " +
+    "and add, re-quantify, swap or remove ingredients (identified by product id). Everything is " +
+    "checked before the first change; if a step fails, the result lists what was already done. " +
+    "If the recipe is in the cart, the cart keeps its old ingredients except for quantity " +
+    "changes; add the recipe to the cart again to pick up added or swapped products.",
+  inputSchema: updateRecipeInputSchema,
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+  handler: async (args) => {
+    assertDistinctIngredientTargets(args)
+    const hasChange =
+      args.name !== undefined ||
+      args.portions !== undefined ||
+      args.note !== undefined ||
+      (args.add_ingredients?.length ?? 0) > 0 ||
+      (args.update_ingredients?.length ?? 0) > 0 ||
+      (args.replace_ingredients?.length ?? 0) > 0 ||
+      (args.remove_ingredients?.length ?? 0) > 0
+    if (!hasChange) throw new Error("Nothing to change: pass at least one field to update.")
+
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = args.recipe_id.toLowerCase()
+
+    // Check everything before the first write.
+    const recipe = await client.recipe.getRecipe(recipeId)
+    if (!recipe.isRecipeOwner) {
+      throw new Error(`Recipe ${recipeId} is not one of your own recipes and cannot be edited.`)
+    }
+    const ingredients = recipe.ingredients ?? []
+    const byProduct = new Map(
+      ingredients.map((ingredient, index) => [ingredient.sellingUnitId, { ingredient, index }]),
+    )
+    const findIngredient = (productId: string) => {
+      const found = byProduct.get(productId)
+      if (!found) {
+        const inRecipe = ingredients.map((i) => i.sellingUnitId).join(", ") || "none"
+        throw new Error(
+          `Product ${productId} is not an ingredient of this recipe (ingredients: ${inRecipe}).`,
+        )
+      }
+      return found
+    }
+    const updates = (args.update_ingredients ?? []).map((u) => ({
+      ...u,
+      ...findIngredient(u.product_id),
+    }))
+    const replacements = (args.replace_ingredients ?? []).map((r) => ({
+      ...r,
+      ...findIngredient(r.product_id),
+    }))
+    const removals = (args.remove_ingredients ?? []).map((productId) => ({
+      productId,
+      ...findIngredient(productId),
+    }))
+    const replacedOrRemoved = new Set([
+      ...replacements.map((r) => r.product_id),
+      ...removals.map((r) => r.productId),
+    ])
+    for (const added of [
+      ...(args.add_ingredients ?? []).map((a) => a.product_id),
+      ...replacements.map((r) => r.new_product_id),
+    ]) {
+      if (byProduct.has(added) && !replacedOrRemoved.has(added)) {
+        throw new Error(
+          `Product ${added} is already an ingredient; use update_ingredients to change its quantity.`,
+        )
+      }
+    }
+    const noteHtml = args.note ? noteToPicnicHtml(args.note) : ""
+    if (args.note !== undefined && args.note.trim() && !noteHtml) {
+      throw new Error("The note contains no text.")
+    }
+
+    const portions = recipe.defaultPortions || recipe.portions || 4
+    const done: string[] = []
+    const run = async (label: string, action: () => Promise<unknown>) => {
+      try {
+        await action()
+        done.push(label)
+      } catch (error) {
+        throw new Error(
+          `Step "${label}" failed: ${getErrorMessage(error)}. ` +
+            (done.length > 0 ? `Already done: ${done.join("; ")}.` : "Nothing was changed."),
+        )
+      }
+    }
+
+    if (args.name !== undefined && args.name !== recipe.name) {
+      const name = args.name
+      await run(`renamed to "${name}"`, () => client.recipe.renameUserDefinedRecipe(recipeId, name))
+    }
+    for (const u of updates) {
+      await run(`set ${u.product_id} to ${u.quantity}`, async () => {
+        // Same product, new quantity: the app sends this as a change within the ingredient.
+        const selection = {
+          quantities: { [u.product_id]: u.quantity },
+          portions,
+          swapType: "WITHIN_SELLING_GROUP_COMPONENT" as const,
+        }
+        const result = await client.recipe.updateRecipeIngredient(
+          recipeId,
+          u.ingredient.ingredientId,
+          selection,
+        )
+        if (result?.shouldUpdateCart) {
+          await client.recipe.updateRecipeIngredientInCart(
+            recipeId,
+            u.ingredient.ingredientId,
+            selection,
+          )
+        }
+      })
+    }
+    // Remove before adding, so a removed product can be added back and positions stay sensible.
+    for (const r of removals) {
+      await run(`removed ${r.productId}`, () =>
+        client.recipe.removeRecipeIngredient(recipeId, r.ingredient.ingredientId),
+      )
+    }
+    for (const r of replacements) {
+      const quantity = r.quantity ?? r.ingredient.quantity ?? 1
+      await run(`replaced ${r.product_id} with ${r.new_product_id}`, async () => {
+        await client.recipe.removeRecipeIngredient(recipeId, r.ingredient.ingredientId)
+        await client.recipe.addUserDefinedRecipeIngredient(recipeId, r.new_product_id, {
+          quantity,
+          portions,
+          order: r.index,
+        })
+      })
+    }
+    let order = ingredients.length - removals.length
+    for (const a of args.add_ingredients ?? []) {
+      const position = order++
+      await run(`added ${a.product_id}`, () =>
+        client.recipe.addUserDefinedRecipeIngredient(recipeId, a.product_id, {
+          quantity: a.quantity ?? 1,
+          portions,
+          order: position,
+        }),
+      )
+    }
+    if (args.note !== undefined) {
+      if (noteHtml) {
+        await run("note replaced", () => client.recipe.setUserDefinedRecipeNote(recipeId, noteHtml))
+      } else {
+        await run("note deleted", () => client.recipe.deleteUserDefinedRecipeNote(recipeId))
+      }
+    }
+    // Portions last: the ingredient quantities above refer to the old default portions.
+    if (args.portions !== undefined && args.portions !== recipe.defaultPortions) {
+      const newPortions = args.portions
+      await run(`portions set to ${newPortions}`, () =>
+        client.recipe.updateUserDefinedRecipePortions(recipeId, newPortions),
+      )
+    }
+
+    return {
+      message: done.length > 0 ? "Recipe updated" : "Nothing changed: the recipe already matched",
+      recipeId,
+      changes: done,
+    }
+  },
+})
+
+toolRegistry.register({
+  name: "picnic_delete_recipe",
+  description:
+    "Permanently delete an own recipe from the Picnic cookbook. Like the app, it first removes " +
+    "the recipe and its ingredients from the cart, unless keep_in_cart is true. Cannot be undone.",
+  inputSchema: z.object({
+    recipe_id: ownRecipeIdSchema,
+    keep_in_cart: z
+      .boolean()
+      .default(false)
+      .describe("Leave the recipe's ingredients in the cart (default: false)."),
+  }),
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = args.recipe_id.toLowerCase()
+
+    const recipe = await client.recipe.getRecipe(recipeId)
+    if (!recipe.isRecipeOwner) {
+      throw new Error(`Recipe ${recipeId} is not one of your own recipes and cannot be deleted.`)
+    }
+
+    let removedFromCart = false
+    if (!args.keep_in_cart) {
+      const cart = await client.cart.getCart()
+      if ((cart.recipes ?? []).some((r) => r.id === recipeId)) {
+        await client.recipe.removeRecipeFromCart(recipeId)
+        removedFromCart = true
+      }
+    }
+    await client.recipe.deleteUserDefinedRecipe(recipeId)
+    return { message: "Recipe deleted", recipeId, name: recipe.name, removedFromCart }
+  },
+})
+
+// Recipe images
+toolRegistry.register({
+  name: "picnic_get_recipe_image_suggestions",
+  description:
+    "List the images Picnic suggests for an own recipe (taken from similar Picnic recipes), " +
+    "with preview URLs. Pass an image_id to picnic_set_recipe_image to use it.",
+  inputSchema: z.object({ recipe_id: ownRecipeIdSchema }),
+  annotations: { readOnlyHint: true, openWorldHint: true },
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = args.recipe_id.toLowerCase()
+    const suggestions = await client.recipe.getUserDefinedRecipeSuggestedImages(recipeId)
+    const base = recipeImageBaseUrl(client)
+    return {
+      recipeId,
+      images: suggestions.map((s) => ({
+        image_id: s.id,
+        preview_url: `${base}/${s.referenceImage.namespace || "recipes"}/${s.id}/large.png`,
+      })),
+    }
+  },
+})
+
+const RECIPE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+const RECIPE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"])
+
+/** Rejects URLs that point at the server itself or a private network. */
+function assertPublicHttpsUrl(raw: string): URL {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new Error("image_url is not a valid URL.")
+  }
+  if (url.protocol !== "https:") throw new Error("image_url must use https.")
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "")
+  const isPrivate =
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".railway.internal") ||
+    /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    host === "::1" ||
+    /^f[cd][0-9a-f]{2}:/.test(host) ||
+    /^fe80:/.test(host)
+  if (isPrivate) throw new Error("image_url must point to a public host.")
+  return url
+}
+
+/** Downloads an image for upload, enforcing type and size limits. */
+async function downloadRecipeImage(raw: string): Promise<{ data: Uint8Array; type: string }> {
+  const url = assertPublicHttpsUrl(raw)
+  const response = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(20_000) })
+  if (!response.ok) throw new Error(`Downloading the image failed with HTTP ${response.status}.`)
+  const type = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase()
+  if (!RECIPE_IMAGE_TYPES.has(type)) {
+    throw new Error(`The image must be JPEG, PNG or WebP (got ${type || "unknown type"}).`)
+  }
+  const length = Number(response.headers.get("content-length") ?? 0)
+  if (length > RECIPE_IMAGE_MAX_BYTES) throw new Error("The image is larger than 5 MB.")
+  const data = new Uint8Array(await response.arrayBuffer())
+  if (data.byteLength > RECIPE_IMAGE_MAX_BYTES) throw new Error("The image is larger than 5 MB.")
+  if (data.byteLength === 0) throw new Error("The downloaded image is empty.")
+  return { data, type }
+}
+
+toolRegistry.register({
+  name: "picnic_set_recipe_image",
+  description:
+    "Set the image of an own recipe: either one of Picnic's suggestions (image_id from " +
+    "picnic_get_recipe_image_suggestions) or an own JPEG/PNG/WebP image downloaded from a " +
+    "public https URL (max 5 MB), which is uploaded to Picnic. Pass exactly one of the two.",
+  inputSchema: z.object({
+    recipe_id: ownRecipeIdSchema,
+    image_id: z.string().trim().min(1).optional().describe("A suggested image id."),
+    image_url: z.string().trim().url().optional().describe("Public https URL of an own image."),
+  }),
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+  handler: async (args) => {
+    if (Boolean(args.image_id) === Boolean(args.image_url)) {
+      throw new Error("Pass exactly one of image_id or image_url.")
+    }
+    // Validate and download before touching the recipe.
+    const download = args.image_url ? await downloadRecipeImage(args.image_url) : null
+
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = args.recipe_id.toLowerCase()
+
+    if (download) {
+      const uploaded = await client.recipe.uploadUserDefinedRecipeImage(recipeId, download)
+      const imageId = uploaded?.image_id ?? uploaded?.imageId
+      if (!imageId) throw new Error("Picnic accepted the upload but returned no image id.")
+      await client.recipe.selectUserDefinedRecipeImage(recipeId, imageId)
+      return {
+        message: "Own image uploaded and set",
+        recipeId,
+        imageId,
+        bytes: download.data.byteLength,
+      }
+    }
+
+    const suggestions = await client.recipe.getUserDefinedRecipeSuggestedImages(recipeId)
+    const suggestion = suggestions.find((s) => s.id === args.image_id)
+    if (!suggestion) {
+      throw new Error(
+        `Image ${args.image_id} is not among the current suggestions; call ` +
+          "picnic_get_recipe_image_suggestions for valid ids.",
+      )
+    }
+    await client.recipe.selectUserDefinedRecipeImage(
+      recipeId,
+      suggestion.id,
+      suggestion.referenceImage,
+    )
+    return { message: "Suggested image set", recipeId, imageId: suggestion.id }
   },
 })
 

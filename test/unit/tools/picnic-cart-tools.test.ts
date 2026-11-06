@@ -280,6 +280,35 @@ describe("picnic_get_cart quantities", () => {
     })
   })
 
+  it("counts a product per line when it is in the cart twice (alone and for a recipe)", async () => {
+    const { toolRegistry } = await import("../../../src/tools/registry.js")
+    // As Picnic returns it: both lines report the product's total count of 2.
+    mocks.getCart.mockResolvedValue(
+      v5Cart({
+        totalCount: 4,
+        items: [
+          cartLine({ id: "623", productId: "s1019780", quantity: 2, displayPrice: 259 }),
+          cartLine({
+            id: "647",
+            productId: "s1019780",
+            quantity: 2,
+            displayPrice: 259,
+            recipeId: "c771ae44030c40d7ac1206f6fcd13d9f",
+          }),
+          cartLine({ id: "643_644", productId: "s1022721", quantity: 2, displayPrice: 1558 }),
+        ],
+      }),
+    )
+
+    const cart = parseToolResult(await toolRegistry.executeTool("picnic_get_cart", {}))
+    const articles = cart.items.map((item: { articles: unknown[] }) => item.articles[0])
+
+    expect(articles[0]).toMatchObject({ product_id: "s1019780", quantity: 1, price: 259 })
+    expect(articles[1]).toMatchObject({ product_id: "s1019780", quantity: 1, price: 259 })
+    // a product in a single line keeps Picnic's quantity
+    expect(articles[2]).toMatchObject({ product_id: "s1022721", quantity: 2, price: 779 })
+  })
+
   it("flags unavailable products", async () => {
     const { toolRegistry } = await import("../../../src/tools/registry.js")
     mocks.getCart.mockResolvedValue(
