@@ -94,7 +94,7 @@ describe("recipe meal-planning tools", () => {
       "GET",
       `/pages/selling-group-details-page?selling_group_id=${encodeURIComponent(RECIPE_A)}`,
       null,
-      true,
+      { includePicnicHeaders: true },
     )
     expect(parseToolResult(result)).toEqual({
       recipeId: RECIPE_A,

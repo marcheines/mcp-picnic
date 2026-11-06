@@ -121,9 +121,13 @@ export class TransportError extends MCPError {
         ? 429
         : code === ErrorCode.TRANSPORT_INVALID_SESSION
           ? 400
-          : code === ErrorCode.TRANSPORT_TIMEOUT
-            ? 408
-            : 500
+          : code === ErrorCode.TRANSPORT_SESSION_EXPIRED
+            ? 404 // MCP spec: unknown/expired session -> 404, client re-initializes
+            : code === ErrorCode.TRANSPORT_TIMEOUT
+              ? 408
+              : code === ErrorCode.SESSION_LIMIT_EXCEEDED
+                ? 503
+                : 500
     super(code, message, statusCode, details)
     this.name = "TransportError"
   }

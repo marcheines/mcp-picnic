@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../../../src/utils/picnic-client.js", () => ({
   getPicnicClient: () => ({
-    catalog: { getImage: mocks.getImage, search: mocks.search },
+    catalog: { getImage: mocks.getImage, getSearchResults: mocks.search },
     sendRequest: vi.fn(),
   }),
   initializePicnicClient: mocks.initializePicnicClient,
@@ -73,11 +73,37 @@ describe("picnic_get_image", () => {
 
   it("still serializes ordinary object results as text", async () => {
     const { toolRegistry } = await import("../../../src/tools/registry.js")
-    mocks.search.mockResolvedValue([{ id: "s1", name: "Bananen", display_price: 169 }])
+    mocks.search.mockResolvedValue({
+      query: "x",
+      correctedQuery: null,
+      recipes: [],
+      products: {
+        sections: [
+          {
+            id: "a",
+            type: "RFY",
+            title: null,
+            products: [{ id: "s1", name: "Bananen", displayPrice: 169 }],
+          },
+          {
+            id: "b",
+            type: "VISUAL",
+            title: null,
+            products: [
+              { id: "s1", name: "Bananen", displayPrice: 169 },
+              { id: "s2", name: "Äpfel", displayPrice: 199 },
+            ],
+          },
+        ],
+      },
+    })
 
     const result = await toolRegistry.executeTool("picnic_search", { query: "x", limit: 1 })
 
     expect(result.content[0].type).toBe("text")
-    expect(JSON.parse(result.content[0].text ?? "").results).toHaveLength(1)
+    const parsed = JSON.parse(result.content[0].text ?? "")
+    expect(parsed.results).toEqual([{ id: "s1", name: "Bananen", price: 169 }])
+    // duplicates across sections are counted once
+    expect(parsed.pagination.total).toBe(2)
   })
 })

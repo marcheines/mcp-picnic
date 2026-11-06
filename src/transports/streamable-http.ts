@@ -117,8 +117,7 @@ export class StreamableHttpServer extends BaseTransportServer {
         if (!hasValidToken) {
           return res.status(401).json({
             error: "Unauthorized",
-            message:
-              "Missing or invalid authentication token. Provide a valid auth header.",
+            message: "Missing or invalid authentication token. Provide a valid auth header.",
           })
         }
 
@@ -239,7 +238,10 @@ export class StreamableHttpServer extends BaseTransportServer {
         ErrorUtils.logError(error, "MCP Request Handler")
         if (!res.headersSent) {
           const errorResponse = ErrorUtils.createSafeErrorResponse(error)
-          res.status(500).json({
+          // Use the status the error carries (e.g. 400 missing session header, 404 unknown
+          // session) instead of turning every failure into a 500.
+          const status = ErrorUtils.isMCPError(error) ? error.statusCode : 500
+          res.status(status).json({
             jsonrpc: "2.0",
             error: errorResponse,
             id: null,
@@ -340,11 +342,24 @@ export class StreamableHttpServer extends BaseTransportServer {
       }
       const transport = this.getTransport(sessionId)
       if (!transport) {
-        throw new TransportError(ErrorCode.TRANSPORT_INVALID_SESSION, "Invalid session ID")
+        throw this.sessionNotFoundError(sessionId)
       }
       this.refreshSessionTimeout(sessionId)
       await transport.handleRequest(req, res, req.body)
     }
+  }
+
+  /**
+   * Error for a session id that is unknown, e.g. because the session timed out or the server
+   * restarted (sessions live in memory, so every redeploy drops them). The MCP spec asks for a
+   * 404 here, which tells the client to start a new session with an initialize request.
+   */
+  private sessionNotFoundError(sessionId: string): TransportError {
+    return new TransportError(
+      ErrorCode.TRANSPORT_SESSION_EXPIRED,
+      "Session not found. It may have expired or the server restarted; send a new initialize request.",
+      { sessionId },
+    )
   }
 
   /**
@@ -359,7 +374,7 @@ export class StreamableHttpServer extends BaseTransportServer {
 
     const transport = this.getTransport(sessionId)
     if (!transport) {
-      throw new TransportError(ErrorCode.TRANSPORT_INVALID_SESSION, "Invalid session ID")
+      throw this.sessionNotFoundError(sessionId)
     }
 
     this.refreshSessionTimeout(sessionId)
@@ -378,7 +393,7 @@ export class StreamableHttpServer extends BaseTransportServer {
 
     const transport = this.getTransport(sessionId)
     if (!transport) {
-      throw new TransportError(ErrorCode.TRANSPORT_INVALID_SESSION, "Invalid session ID")
+      throw this.sessionNotFoundError(sessionId)
     }
 
     await transport.handleRequest(req, res, req.body)

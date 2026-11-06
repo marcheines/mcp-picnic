@@ -174,7 +174,7 @@ export async function initializePicnicClient(
     const loginResult = await client.auth.login(loginUsername, loginPassword)
     picnicClientInstance = client
 
-    if (loginResult?.second_factor_authentication_required) {
+    if (loginResult?.secondFactorAuthenticationRequired) {
       console.error(
         "Picnic client logged in, but 2FA is required. Use the 2FA tools to complete authentication.",
       )

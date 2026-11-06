@@ -441,4 +441,60 @@ describe("StreamableHttpServer", () => {
     expect(transport.closeCalls).toBe(1)
     expect(server.getActiveSessions()).toEqual([])
   })
+
+  describe("session errors", () => {
+    async function request(
+      method: string,
+      headers: Record<string, string>,
+      body?: string,
+    ): Promise<{ statusCode: number; body: any }> {
+      // @ts-expect-error - private property access
+      const httpServer = server.server as http.Server
+      const address = httpServer.address() as { port: number }
+      return new Promise((resolve, reject) => {
+        const req = http.request(
+          { hostname: "127.0.0.1", port: address.port, path: "/mcp", method, headers },
+          (response) => {
+            let data = ""
+            response.on("data", (chunk) => (data += chunk))
+            response.on("end", () =>
+              resolve({ statusCode: response.statusCode!, body: data ? JSON.parse(data) : null }),
+            )
+          },
+        )
+        req.on("error", reject)
+        if (body) req.write(body)
+        req.end()
+      })
+    }
+
+    const toolsList = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+
+    beforeEach(async () => {
+      vi.useRealTimers()
+      server = new StreamableHttpServer({ port: 0, enableRequestLogging: false })
+      await server.start()
+    })
+
+    it.each(["POST", "GET", "DELETE"])(
+      "answers %s with an unknown session id with 404 instead of 500",
+      async (method) => {
+        const res = await request(
+          method,
+          { "Content-Type": "application/json", "mcp-session-id": "does-not-exist" },
+          method === "POST" ? toolsList : undefined,
+        )
+
+        expect(res.statusCode).toBe(404)
+        expect(res.body.jsonrpc).toBe("2.0")
+        expect(res.body.error.message).toMatch(/Session not found/)
+      },
+    )
+
+    it("answers a non-initialize POST without session id with 400", async () => {
+      const res = await request("POST", { "Content-Type": "application/json" }, toolsList)
+
+      expect(res.statusCode).toBe(400)
+    })
+  })
 })

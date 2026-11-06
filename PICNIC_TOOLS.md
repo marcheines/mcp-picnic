@@ -246,6 +246,21 @@ List user-created Picnic recipes.
 - `limit` (number, optional): Maximum number of recipes to return (1-100, default: 25)
 - `offset` (number, optional): Number of recipes to skip for pagination (default: 0)
 
+#### `picnic_create_recipe`
+
+Create an own recipe in the Picnic cookbook ("Eigene Rezepte"). The returned id (32 hex
+characters) works with `picnic_get_recipe` and `picnic_add_recipe_to_cart`. Not idempotent:
+check `picnic_get_own_recipes` before retrying after an error.
+
+**Parameters:**
+
+- `name` (string, required): Recipe name (max 43 characters, the app's limit)
+- `portions` (number, optional): Default portions the quantities are for (1-20, default: 4)
+- `ingredients` (array, required): `{ product_id, quantity }` objects; `product_id` is a Picnic
+  product id from `picnic_search` (e.g. `s1018231`), `quantity` the number of packages (default: 1).
+  Each product may appear only once.
+- `note` (string, optional): Free-text note (max 5000 characters); each line becomes a paragraph
+
 #### `picnic_save_recipe`
 
 Save a recipe to the user's Picnic cookbook.

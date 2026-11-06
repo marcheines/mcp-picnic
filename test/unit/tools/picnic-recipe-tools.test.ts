@@ -110,12 +110,9 @@ describe("recipe tools", () => {
     const result = await toolRegistry.executeTool("picnic_browse_recipes", {})
     const payload = parseToolResult(result)
 
-    expect(mocks.sendRequest).toHaveBeenCalledWith(
-      "GET",
-      "/pages/cookbook-page-content",
-      null,
-      true,
-    )
+    expect(mocks.sendRequest).toHaveBeenCalledWith("GET", "/pages/cookbook-page-content", null, {
+      includePicnicHeaders: true,
+    })
     expect(payload.categories).toEqual(["recipe_cattree_20minuten", "recipe-cattree-jamie-oliver"])
   })
 
@@ -141,14 +138,14 @@ describe("recipe tools", () => {
       "GET",
       "/pages/recipe_cattree_jamie-oliver",
       null,
-      true,
+      { includePicnicHeaders: true },
     )
     expect(mocks.sendRequest).toHaveBeenNthCalledWith(
       2,
       "GET",
       "/pages/recipe-cattree-jamie-oliver",
       null,
-      true,
+      { includePicnicHeaders: true },
     )
     expect(payload.pageId).toBe("recipe-cattree-jamie-oliver")
     expect(payload.recipes[0].recipeId).toBe(RECIPE_A)
@@ -166,7 +163,7 @@ describe("recipe tools", () => {
       "GET",
       "/pages/recipe-cattree-jamie-oliver",
       null,
-      true,
+      { includePicnicHeaders: true },
     )
   })
 

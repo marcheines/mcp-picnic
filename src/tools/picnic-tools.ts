@@ -1,4 +1,5 @@
 import { z } from "zod"
+import type PicnicClient from "picnic-api"
 import { toolRegistry, mcpContent } from "./registry.js"
 import {
   getPicnicClient,
@@ -18,6 +19,8 @@ import {
   parseRecipeIngredients,
 } from "../utils/recipe-meal-planning.js"
 import { config } from "../config.js"
+
+type PicnicDeliveryStatus = PicnicClient.Types.cart.DeliveryStatus
 
 /**
  * Picnic API tools optimized for LLM consumption
@@ -247,7 +250,17 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const allResults = await client.catalog.search(args.query)
+    const searchResults = await client.catalog.getSearchResults(args.query)
+    // picnic-api 5 returns the results grouped in sections; a product can appear in several
+    // sections (e.g. "bought before" and its product group), so flatten and de-duplicate.
+    const seen = new Set<string>()
+    const allResults = (searchResults.products?.sections ?? [])
+      .flatMap((section) => section.products)
+      .filter((product) => {
+        if (seen.has(product.id)) return false
+        seen.add(product.id)
+        return true
+      })
 
     // Apply pagination
     const startIndex = args.offset || 0
@@ -258,10 +271,12 @@ toolRegistry.register({
     const filteredResults = paginatedResults.map((product) => ({
       id: product.id,
       name: product.name,
-      price: product.display_price,
-      unit: product.unit_quantity,
+      ...(product.brand && { brand: product.brand }),
+      price: product.displayPrice,
+      unit: product.unitQuantity,
+      ...(product.isUnavailable && { unavailable: true }),
       // Only include image_id if it exists, for potential image retrieval
-      ...(product.image_id && { image_id: product.image_id }),
+      ...(product.imageId && { image_id: product.imageId }),
     }))
 
     return {
@@ -303,12 +318,9 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const page = await client.sendRequest(
-      "GET",
-      "/pages/promo-page-all-promos-redirect",
-      null,
-      true,
-    )
+    const page = await client.sendRequest("GET", "/pages/promo-page-all-promos-redirect", null, {
+      includePicnicHeaders: true,
+    })
     const allPromotions = extractPromotionsFromPage(page)
 
     const startIndex = args.offset ?? 0
@@ -379,7 +391,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const details = await client.catalog.getProductDetails(args.productId)
+    const details = await client.catalog.getProduct(args.productId)
 
     if (args.full) {
       return details
@@ -443,7 +455,9 @@ const RECIPE_CATEGORY_PAGE_ID_RE = /recipe[_-]cattree[_-][a-z0-9]+(?:[a-z0-9_-]*
 const RECIPE_CATEGORY_PREFIX_RE = /^recipe[_-]cattree[_-]/i
 
 async function fetchRecipePage(client: ReturnType<typeof getPicnicClient>, pageId: string) {
-  const page = await client.sendRequest("GET", `/pages/${pageId}`, null, true)
+  const page = await client.sendRequest("GET", `/pages/${pageId}`, null, {
+    includePicnicHeaders: true,
+  })
   return { pageId, page }
 }
 
@@ -539,7 +553,7 @@ toolRegistry.register({
       "GET",
       `/pages/selling-group-details-page?selling_group_id=${encodeURIComponent(recipeId)}`,
       null,
-      true,
+      { includePicnicHeaders: true },
     )
     const parsed = parseSellingGroupRecipe(page, { imageBaseUrl: recipeImageBaseUrl(client) })
     const sourceUrl = buildRecipeSourceUrl(config.PICNIC_COUNTRY_CODE, recipeId)
@@ -624,12 +638,151 @@ toolRegistry.register({
   },
 })
 
+// Create an own (user-defined) recipe
+const PICNIC_PRODUCT_ID_RE = /^s\d+$/
+// Limits enforced by the Picnic app's recipe editor.
+const OWN_RECIPE_NAME_MAX = 43
+const OWN_RECIPE_NOTE_MAX = 5000
+
+const createRecipeInputSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .max(OWN_RECIPE_NAME_MAX)
+    .describe(`Recipe name (max ${OWN_RECIPE_NAME_MAX} characters, the app's limit).`),
+  portions: z
+    .number()
+    .int()
+    .min(1)
+    .max(20)
+    .default(4)
+    .describe("Default number of portions the ingredient quantities are for (default: 4)."),
+  ingredients: z
+    .array(
+      z.object({
+        product_id: z
+          .string()
+          .regex(PICNIC_PRODUCT_ID_RE, "Expected a Picnic product id such as s1018231")
+          .describe("Picnic product (selling unit) id from picnic_search, e.g. s1018231."),
+        quantity: z
+          .number()
+          .int()
+          .min(1)
+          .default(1)
+          .describe("Number of product units (packages, not grams) for the given portions."),
+      }),
+    )
+    .min(1)
+    .describe("The ingredients as Picnic products. Each product may appear only once."),
+  note: z
+    .string()
+    .max(OWN_RECIPE_NOTE_MAX)
+    .optional()
+    .describe(
+      "Optional free-text note, e.g. preparation steps or amounts in grams. Plain text; " +
+        "blank lines separate paragraphs.",
+    ),
+})
+
+/** Escapes text for the HTML the Picnic recipe note editor stores. */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+}
+
+/**
+ * Converts a plain-text note into the paragraph HTML produced by the Picnic app's editor,
+ * e.g. `<p>400g Nudeln</p><p>Nudeln kochen.</p>`. Every line becomes its own paragraph.
+ */
+export function noteToPicnicHtml(note: string): string {
+  return note
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => `<p>${escapeHtml(line)}</p>`)
+    .join("")
+}
+
+toolRegistry.register({
+  name: "picnic_create_recipe",
+  description:
+    "Create an own recipe in the user's Picnic cookbook ('Eigene Rezepte') with a name, " +
+    "default portions, ingredients as Picnic products (ids from picnic_search) and an optional " +
+    "note. Returns the new recipe id, which works with picnic_get_recipe and " +
+    "picnic_add_recipe_to_cart. Not idempotent: calling it twice creates two recipes, so check " +
+    "picnic_get_own_recipes before retrying after an error.",
+  inputSchema: createRecipeInputSchema,
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+  handler: async (args) => {
+    const productIds = args.ingredients.map((ingredient) => ingredient.product_id)
+    const duplicates = productIds.filter((id, index) => productIds.indexOf(id) !== index)
+    if (duplicates.length > 0) {
+      throw new Error(
+        `Each product may appear only once; combine the quantities of: ${[...new Set(duplicates)].join(", ")}`,
+      )
+    }
+    const noteHtml = args.note ? noteToPicnicHtml(args.note) : ""
+
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const portions = args.portions ?? 4
+    const created = await client.recipe.createUserDefinedRecipe(
+      args.name,
+      args.ingredients.map((ingredient) => ({
+        sellingUnitId: ingredient.product_id,
+        quantity: ingredient.quantity ?? 1,
+      })),
+      portions,
+    )
+    const recipeId = created?.sellingGroupId
+    if (!recipeId) {
+      throw new Error(
+        "Picnic did not return an id for the new recipe. It may still have been created; " +
+          "check picnic_get_own_recipes before retrying.",
+      )
+    }
+
+    const result: Record<string, unknown> = {
+      message: "Recipe created",
+      recipeId,
+      name: args.name,
+      portions,
+      ingredientCount: args.ingredients.length,
+    }
+
+    if (noteHtml) {
+      try {
+        await client.recipe.setUserDefinedRecipeNote(recipeId, noteHtml)
+        result.note = "saved"
+      } catch (error) {
+        // The recipe exists already; report the partial result instead of failing, so a
+        // retry does not create a duplicate recipe.
+        result.note = "failed"
+        result.warning =
+          `The recipe was created, but saving the note failed: ${getErrorMessage(error)}. ` +
+          "Do not create the recipe again."
+      }
+    }
+
+    return result
+  },
+})
+
 // Save / unsave recipe
 const recipeRefInputSchema = z.object({
   recipe_url_or_id: z
     .string()
     .min(1)
-    .describe("A Picnic recipe URL (any format) or a 24-character hex recipe ID."),
+    .describe("A Picnic recipe URL (any format) or a 24- or 32-character hex recipe ID."),
 })
 
 toolRegistry.register({
@@ -644,7 +797,7 @@ toolRegistry.register({
       "POST",
       "/pages/task/recipe-saving",
       { payload: { recipe_id: recipeId, saved_at: new Date().toISOString() } },
-      true,
+      { includePicnicHeaders: true },
     )
     return { message: "Recipe saved", recipeId }
   },
@@ -662,7 +815,7 @@ toolRegistry.register({
       "POST",
       "/pages/task/recipe-saving",
       { payload: { recipe_id: recipeId, saved_at: null } },
-      true,
+      { includePicnicHeaders: true },
     )
     return { message: "Recipe removed from cookbook", recipeId }
   },
@@ -673,7 +826,10 @@ const addRecipeToCartInputSchema = z.object({
   recipe_url_or_id: z
     .string()
     .min(1)
-    .describe("A Picnic recipe URL (any format) or a 24-character hex recipe ID."),
+    .describe(
+      "A Picnic recipe URL (any format), a 24-character catalog recipe ID or a 32-character " +
+        "own-recipe ID (from picnic_get_own_recipes or picnic_create_recipe).",
+    ),
   portions: z
     .number()
     .min(1)
@@ -696,7 +852,12 @@ toolRegistry.register({
     const payload: { selling_group_id: string; portions?: number } = { selling_group_id: recipeId }
     if (args.portions !== undefined) payload.portions = args.portions
     await mutateCart("Adding the recipe to the cart", () =>
-      client.sendRequest("POST", "/pages/task/assign-selling-group-to-basket", { payload }, true),
+      client.sendRequest(
+        "POST",
+        "/pages/task/assign-selling-group-to-basket",
+        { payload },
+        { includePicnicHeaders: true },
+      ),
     )
     return {
       message: "Recipe added to cart",
@@ -723,7 +884,7 @@ toolRegistry.register({
         "POST",
         "/pages/task/remove-selling-group-from-basket",
         { payload: { selling_group_id: recipeId } },
-        true,
+        { includePicnicHeaders: true },
       ),
     )
     return { message: "Recipe removed from cart", recipeId }
@@ -747,7 +908,7 @@ async function fetchRecipeIngredientsByRef(
     "GET",
     `/pages/selling-group-details-page?selling_group_id=${encodeURIComponent(recipeId)}`,
     null,
-    true,
+    { includePicnicHeaders: true },
   )
   const parsed = parseRecipeIngredients(page)
   if (!parsed) throw new Error(`Could not find recipe ingredient data for ${recipeId}`)
@@ -993,7 +1154,9 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const allDeliveries = await client.delivery.getDeliveries(args.filter as string[])
+    const allDeliveries = await client.delivery.getDeliverySummaries(
+      args.filter as PicnicDeliveryStatus[],
+    )
 
     // Apply pagination
     const startIndex = args.offset || 0
@@ -1051,7 +1214,12 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const scenario = await client.delivery.getDeliveryScenario(args.deliveryId)
+    const scenario = await client.sendRequest(
+      "GET",
+      `/deliveries/${encodeURIComponent(args.deliveryId)}/scenario`,
+      null,
+      { includePicnicHeaders: true },
+    )
     return scenario
   },
 })
@@ -1128,7 +1296,10 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const orderStatus = await client.cart.getOrderStatus(args.orderId)
+    const orderStatus = await client.sendRequest(
+      "GET",
+      `/cart/checkout/order/${encodeURIComponent(args.orderId)}/status`,
+    )
     return orderStatus
   },
 })
@@ -1141,7 +1312,7 @@ toolRegistry.register({
   handler: async () => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const user = await client.user.getUserDetails()
+    const user = await client.user.getUser()
     return user
   },
 })
@@ -1205,7 +1376,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const details = await client.payment.getWalletTransactionDetails(args.transactionId as string)
+    const details = await client.payment.getWalletTransaction(args.transactionId as string)
     return details
   },
 })

@@ -139,7 +139,7 @@ describe("promotions tools", () => {
       "GET",
       "/pages/promo-page-all-promos-redirect",
       null,
-      true,
+      { includePicnicHeaders: true },
     )
     expect(payload.promotions).toEqual([
       {
