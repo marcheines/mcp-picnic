@@ -28,7 +28,55 @@ function parseToolResult(result: ToolResult) {
   return JSON.parse(result.content[0].text ?? "")
 }
 
-const emptyCart = { type: "ORDER", id: "cart-1", items: [], total_count: 0 }
+/** A cart line as picnic-api 5 returns it (CartLineItem). */
+function cartLine(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "1871",
+    productId: "s1032332",
+    name: "Frosch Cremeseife",
+    unitQuantity: "500ml",
+    imageId: "img-1",
+    quantity: 1,
+    maxCount: 50,
+    displayPrice: 255,
+    originalPrice: null,
+    priceColor: null,
+    priceRanges: null,
+    labels: [],
+    basePrice: "€5,10/l",
+    freshness: null,
+    characteristics: [],
+    isUnavailable: false,
+    unavailableReason: null,
+    replacements: [],
+    bundlesLink: null,
+    recipeId: null,
+    ...overrides,
+  }
+}
+
+/** A cart as picnic-api 5 returns it (Cart). */
+function v5Cart(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "shopping_cart",
+    mts: 1,
+    items: [],
+    totalCount: 0,
+    totalPrice: 0,
+    discount: 0,
+    promotionSavings: 0,
+    membershipSavings: 0,
+    deposits: [],
+    depositTotal: 0,
+    fees: [],
+    minimumOrderValue: null,
+    selectedSlot: null,
+    recipes: [],
+    ...overrides,
+  }
+}
+
+const emptyCart = v5Cart({ id: "cart-1" })
 
 describe("picnic cart tools", () => {
   beforeEach(async () => {
@@ -138,48 +186,134 @@ describe("picnic_get_cart quantities", () => {
     await import("../../../src/tools/picnic-tools.js")
   })
 
-  // Without this the caller cannot verify whether an ambiguous add landed once or twice,
+  // Without the quantity the caller cannot verify whether an ambiguous add landed once or twice,
   // which is exactly what the mutation error message tells it to go and check.
-  it("surfaces the QUANTITY decorator as a quantity field", async () => {
+  it("maps picnic-api 5 cart lines to articles with name, quantity and prices", async () => {
     const { toolRegistry } = await import("../../../src/tools/registry.js")
-    mocks.getCart.mockResolvedValue({
-      type: "ORDER",
+    mocks.getCart.mockResolvedValue(
+      v5Cart({
+        totalCount: 3,
+        totalPrice: 1089,
+        promotionSavings: 50,
+        minimumOrderValue: 3500,
+        items: [
+          cartLine({ quantity: 2, displayPrice: 510 }),
+          cartLine({
+            id: "1872",
+            productId: "s1022214",
+            name: "Hähnchenbrustfilet",
+            unitQuantity: "600g",
+            imageId: null,
+            displayPrice: 579,
+            originalPrice: 679,
+            labels: [{ text: "Angebot", textColor: null, backgroundColor: null }],
+            recipeId: "0123456789abcdef0123456789abcdef",
+          }),
+        ],
+        selectedSlot: {
+          slotId: "slot-1",
+          state: "EXPLICIT",
+          windowStart: "2026-11-07T16:00:00+01:00",
+          windowEnd: "2026-11-07T18:00:00+01:00",
+          isExplicitSelection: true,
+        },
+        recipes: [
+          {
+            id: "0123456789abcdef0123456789abcdef",
+            title: "Hähnchen-Wraps",
+            preTitle: "3 Portionen",
+            subtitle: null,
+            imageId: null,
+          },
+        ],
+      }),
+    )
+
+    const cart = parseToolResult(await toolRegistry.executeTool("picnic_get_cart", {}))
+
+    expect(cart.items).toEqual([
+      {
+        order_line_id: "1871",
+        price: 510,
+        articles: [
+          {
+            product_id: "s1032332",
+            name: "Frosch Cremeseife",
+            unit: "500ml",
+            price: 255,
+            quantity: 2,
+            image_id: "img-1",
+          },
+        ],
+      },
+      {
+        order_line_id: "1872",
+        price: 579,
+        original_price: 679,
+        articles: [
+          {
+            product_id: "s1022214",
+            name: "Hähnchenbrustfilet",
+            unit: "600g",
+            price: 579,
+            quantity: 1,
+          },
+        ],
+        labels: ["Angebot"],
+        recipe_id: "0123456789abcdef0123456789abcdef",
+      },
+    ])
+    expect(cart).toMatchObject({
       id: "shopping_cart",
-      total_count: 2,
-      items: [
+      total_count: 3,
+      total_price: 1089,
+      total_savings: 50,
+      minimum_order_value: 3500,
+      selected_slot: { slot_id: "slot-1", explicitly_selected: true },
+      recipes: [
         {
-          type: "ORDER_LINE",
-          id: "1871",
-          price: 510,
-          items: [
-            {
-              id: "s1032332",
-              name: "Frosch Cremeseife",
-              unit_quantity: "500ml",
-              price: 255,
-              decorators: [
-                { type: "QUANTITY", quantity: 2 },
-                { type: "UNIT_QUANTITY", unit_quantity_text: "500ml" },
-              ],
-            },
-          ],
+          recipe_id: "0123456789abcdef0123456789abcdef",
+          title: "Hähnchen-Wraps",
+          portions: "3 Portionen",
         },
       ],
     })
-
-    const cart = parseToolResult(await toolRegistry.executeTool("picnic_get_cart", {}))
-    expect(cart.items[0].articles[0].quantity).toBe(2)
   })
 
-  it("defaults to 1 when no QUANTITY decorator is present", async () => {
+  it("flags unavailable products", async () => {
     const { toolRegistry } = await import("../../../src/tools/registry.js")
-    mocks.getCart.mockResolvedValue({
-      type: "ORDER",
-      id: "shopping_cart",
-      items: [{ id: "1", price: 255, items: [{ id: "s1", name: "x", price: 255 }] }],
-    })
+    mocks.getCart.mockResolvedValue(
+      v5Cart({
+        totalCount: 1,
+        items: [cartLine({ isUnavailable: true, unavailableReason: "Ausverkauft" })],
+      }),
+    )
 
     const cart = parseToolResult(await toolRegistry.executeTool("picnic_get_cart", {}))
-    expect(cart.items[0].articles[0].quantity).toBe(1)
+    expect(cart.items[0]).toMatchObject({ unavailable: true, unavailable_reason: "Ausverkauft" })
+  })
+
+  it("returns the mapped cart from add_to_cart and remove_from_cart", async () => {
+    const { toolRegistry } = await import("../../../src/tools/registry.js")
+    const cart = v5Cart({ totalCount: 1, totalPrice: 255, items: [cartLine()] })
+    mocks.addProductToCart.mockResolvedValue(cart)
+    mocks.removeProductFromCart.mockResolvedValue(cart)
+
+    const added = parseToolResult(
+      await toolRegistry.executeTool("picnic_add_to_cart", { productId: "s1032332", count: 1 }),
+    )
+    const removed = parseToolResult(
+      await toolRegistry.executeTool("picnic_remove_from_cart", { productId: "s1", count: 1 }),
+    )
+
+    for (const result of [added, removed]) {
+      expect(result.cart.items[0].articles[0]).toMatchObject({
+        product_id: "s1032332",
+        name: "Frosch Cremeseife",
+        quantity: 1,
+        price: 255,
+      })
+      expect(result.cart.total_price).toBe(255)
+    }
   })
 })

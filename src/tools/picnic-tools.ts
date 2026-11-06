@@ -73,57 +73,76 @@ const CART_MUTATION_ANNOTATIONS = {
   openWorldHint: true,
 } as const
 
-// Helper function to filter cart data for LLM consumption
-function filterCartData(cart: unknown) {
+type PicnicCart = PicnicClient.Types.cart.Cart
+
+/**
+ * Reduces the picnic-api 5 cart model to what an LLM needs.
+ *
+ * Keeps the output shape of the 4.x version (order lines with an `articles` list, snake_case
+ * totals) so existing callers keep working. In 5.x every cart line holds exactly one product
+ * with its quantity and line price, so each order line carries one article.
+ */
+export function filterCartData(cart: PicnicCart | null | undefined) {
   if (!cart || typeof cart !== "object") return cart
 
-  const cartObj = cart as {
-    type?: string
-    id?: string
-    items?: Array<{
-      id?: string
-      display_price?: number
-      price?: number
-      items?: Array<{
-        id?: string
-        name?: string
-        unit_quantity?: string
-        price?: number
-        image_ids?: string[]
-        max_count?: number
-        decorators?: Array<{ type?: string; quantity?: number }>
-      }>
-    }>
-    total_count?: number
-    total_price?: number
-    checkout_total_price?: number
-    total_savings?: number
-  }
-
-  const filteredItems = cartObj.items?.map((orderLine) => ({
-    order_line_id: orderLine.id,
-    price: orderLine.display_price || orderLine.price,
-    articles: orderLine.items?.map((article) => ({
-      product_id: article.id,
-      name: article.name,
-      unit: article.unit_quantity,
-      price: article.price,
-      // How many of this article are in the cart. Picnic carries it in a QUANTITY decorator
-      // rather than a plain field; without it a caller cannot tell one unit from three, so it
-      // cannot check whether an ambiguous add actually landed (see mutateCart).
-      quantity: article.decorators?.find((d) => d.type === "QUANTITY")?.quantity ?? 1,
-      ...(article.image_ids?.length && { image_id: article.image_ids[0] }),
-    })),
-  }))
+  const items = (cart.items ?? []).map((line) => {
+    const quantity = line.quantity ?? 1
+    return {
+      order_line_id: line.id,
+      // Line price in cents, after discounts (all units of the product together).
+      price: line.displayPrice,
+      ...(line.originalPrice != null && { original_price: line.originalPrice }),
+      articles: [
+        {
+          product_id: line.productId,
+          name: line.name,
+          unit: line.unitQuantity,
+          // Price per unit in cents. How many units are in the cart matters to callers: it is
+          // what they check when a mutation failed ambiguously (see mutateCart).
+          price: quantity > 0 ? Math.round(line.displayPrice / quantity) : line.displayPrice,
+          quantity,
+          ...(line.imageId && { image_id: line.imageId }),
+        },
+      ],
+      ...(line.labels?.length && {
+        labels: line.labels.map((label) => label.text).filter(Boolean),
+      }),
+      ...(line.isUnavailable && {
+        unavailable: true,
+        ...(line.unavailableReason && { unavailable_reason: line.unavailableReason }),
+      }),
+      ...(line.recipeId && { recipe_id: line.recipeId }),
+    }
+  })
 
   return {
-    type: cartObj.type,
-    id: cartObj.id,
-    items: filteredItems,
-    total_count: cartObj.total_count,
-    total_price: cartObj.total_price,
-    checkout_total_price: cartObj.checkout_total_price,
-    total_savings: cartObj.total_savings,
+    id: cart.id,
+    items,
+    total_count: cart.totalCount,
+    // Amount to pay in cents, including deposits and fees.
+    total_price: cart.totalPrice,
+    total_savings: cart.promotionSavings,
+    ...(cart.membershipSavings ? { membership_savings: cart.membershipSavings } : {}),
+    ...(cart.depositTotal ? { deposit_total: cart.depositTotal } : {}),
+    ...(cart.fees?.length && {
+      fees: cart.fees.map((fee) => ({ name: fee.name, amount: fee.amount })),
+    }),
+    ...(cart.minimumOrderValue != null && { minimum_order_value: cart.minimumOrderValue }),
+    ...(cart.selectedSlot && {
+      selected_slot: {
+        slot_id: cart.selectedSlot.slotId,
+        window_start: cart.selectedSlot.windowStart,
+        window_end: cart.selectedSlot.windowEnd,
+        explicitly_selected: cart.selectedSlot.isExplicitSelection,
+      },
+    }),
+    ...(cart.recipes?.length && {
+      recipes: cart.recipes.map((recipe) => ({
+        recipe_id: recipe.id,
+        title: recipe.title,
+        ...(recipe.preTitle && { portions: recipe.preTitle }),
+      })),
+    }),
   }
 }
 
