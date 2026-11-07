@@ -1,4 +1,5 @@
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
+import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js"
 import express, { Request, Response, NextFunction } from "express"
 import cors from "cors"
 import { BaseTransportServer } from "./base.js"
@@ -287,10 +288,17 @@ export class StreamableHttpServer extends BaseTransportServer {
    * The Picnic client and its login are process-wide, so nothing per-connection is lost.
    */
   private async handlePostRequest(req: Request, res: Response): Promise<void> {
+    this.dropUnsupportedProtocolVersion(req)
+
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     })
+    // Log why the SDK rejects a request; the access log alone only shows the status code.
+    transport.onerror = (error: Error) => {
+      const method = Array.isArray(req.body) ? "batch" : (req.body?.method ?? "unknown")
+      console.error(`[MCP transport] ${method}: ${error.message}`)
+    }
     const server = this.createConfiguredServer()
     const entry = { transport, server }
     this.activeRequests.add(entry)
@@ -302,6 +310,28 @@ export class StreamableHttpServer extends BaseTransportServer {
 
     await server.connect(transport)
     await transport.handleRequest(req, res, req.body)
+  }
+
+  /**
+   * Remove an MCP-Protocol-Version header this SDK does not know.
+   *
+   * The SDK answers such requests with 400, which makes Claude mark the connector disconnected.
+   * A client on a newer protocol revision than the SDK still talks a compatible subset, and a
+   * stateless server has no negotiated version to protect, so the SDK default is used instead.
+   */
+  private dropUnsupportedProtocolVersion(req: Request): void {
+    const version = req.headers["mcp-protocol-version"]
+    if (typeof version !== "string" || SUPPORTED_PROTOCOL_VERSIONS.includes(version)) {
+      return
+    }
+    console.error(`[MCP transport] ignoring unsupported MCP-Protocol-Version: ${version}`)
+    delete req.headers["mcp-protocol-version"]
+    const raw = req.rawHeaders
+    for (let i = raw.length - 2; i >= 0; i -= 2) {
+      if (raw[i].toLowerCase() === "mcp-protocol-version") {
+        raw.splice(i, 2)
+      }
+    }
   }
 
   /**

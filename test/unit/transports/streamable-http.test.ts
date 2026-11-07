@@ -13,6 +13,7 @@ vi.mock("crypto", () => ({
 }))
 
 const transportOptions: unknown[] = []
+const seenHeaders: Array<{ headers: Record<string, unknown>; rawHeaders: string[] }> = []
 
 vi.mock("@modelcontextprotocol/sdk/server/streamableHttp.js", () => ({
   // A plain class: vi.restoreAllMocks() in afterEach would strip a vi.fn() implementation.
@@ -21,7 +22,11 @@ vi.mock("@modelcontextprotocol/sdk/server/streamableHttp.js", () => ({
       transportOptions.push(options)
     }
     async close() {}
-    async handleRequest(_req: unknown, res: { status: (n: number) => any }) {
+    async handleRequest(
+      req: { headers: Record<string, unknown>; rawHeaders: string[] },
+      res: { status: (n: number) => any },
+    ) {
+      seenHeaders.push({ headers: { ...req.headers }, rawHeaders: [...req.rawHeaders] })
       res.status(200).json({ jsonrpc: "2.0", id: 1, result: {} })
     }
   },
@@ -397,6 +402,7 @@ describe("StreamableHttpServer", () => {
     beforeEach(async () => {
       vi.useRealTimers()
       transportOptions.length = 0
+      seenHeaders.length = 0
       server = new StreamableHttpServer({ port: 0, enableRequestLogging: false })
       await server.start()
     })
@@ -427,6 +433,30 @@ describe("StreamableHttpServer", () => {
 
       expect(transportOptions).toHaveLength(2)
       expect(mockSDKServer.connect).toHaveBeenCalledTimes(2)
+    })
+
+    it("drops an MCP-Protocol-Version header the SDK does not support instead of failing", async () => {
+      const res = await request(
+        "POST",
+        { "Content-Type": "application/json", "MCP-Protocol-Version": "2099-01-01" },
+        toolsList,
+      )
+
+      expect(res.statusCode).toBe(200)
+      expect(seenHeaders[0].headers["mcp-protocol-version"]).toBeUndefined()
+      expect(seenHeaders[0].rawHeaders.map((h) => h.toLowerCase())).not.toContain(
+        "mcp-protocol-version",
+      )
+    })
+
+    it("keeps a supported MCP-Protocol-Version header", async () => {
+      await request(
+        "POST",
+        { "Content-Type": "application/json", "MCP-Protocol-Version": "2025-06-18" },
+        toolsList,
+      )
+
+      expect(seenHeaders[0].headers["mcp-protocol-version"]).toBe("2025-06-18")
     })
 
     it.each(["GET", "DELETE"])("answers %s with 405", async (method) => {
