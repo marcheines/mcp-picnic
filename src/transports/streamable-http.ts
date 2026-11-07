@@ -1,9 +1,8 @@
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
-import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js"
+import { createMcpHandler } from "@modelcontextprotocol/server"
+import { toNodeHandler } from "@modelcontextprotocol/node"
 import express, { Request, Response, NextFunction } from "express"
 import cors from "cors"
 import { BaseTransportServer } from "./base.js"
-import type { createMCPServer } from "../utils/server-factory.js"
 import { TransportError, ErrorCode, ErrorUtils } from "../types/errors.js"
 import { createRateLimitMiddleware, RateLimitConfig } from "../utils/rate-limiter.js"
 import { timingSafeEqual } from "crypto"
@@ -34,10 +33,15 @@ export class StreamableHttpServer extends BaseTransportServer {
   private host: string
   private options: StreamableHttpServerOptions
   private rateLimiter?: ReturnType<typeof createRateLimitMiddleware>
-  private activeRequests = new Set<{
-    transport: StreamableHTTPServerTransport
-    server: ReturnType<typeof createMCPServer>
-  }>()
+  private activeRequests = 0
+  // One handler serves both protocol eras: 2026-07-28 requests (server/discover, per-request
+  // _meta envelope) and 2025-era requests (initialize handshake) via the SDK's stateless fallback.
+  private mcpHandler = createMcpHandler(() => this.createConfiguredServer(), {
+    legacy: "stateless",
+    responseMode: "json",
+    onerror: (error: Error) => console.error(`[MCP transport] ${error.message}`),
+  })
+  private nodeHandler = toNodeHandler(this.mcpHandler)
 
   /**
    * Create a new HTTP server for MCP over HTTP
@@ -228,11 +232,11 @@ export class StreamableHttpServer extends BaseTransportServer {
    * Set up the routes for MCP over HTTP
    */
   private setupRoutes(): void {
-    // MCP endpoint. The server is stateless: every POST is handled on its own, so there are
-    // no sessions that can expire, get lost on a redeploy, or be missing from a request.
-    this.app.post("/mcp", async (req: Request, res: Response) => {
+    // MCP endpoint. Every request is handled on its own (no sessions), so nothing can expire,
+    // get lost on a redeploy, or be missing from a request. GET/DELETE are answered by the SDK.
+    this.app.all("/mcp", async (req: Request, res: Response) => {
       try {
-        await this.handlePostRequest(req, res)
+        await this.handleMcpRequest(req, res)
       } catch (error) {
         ErrorUtils.logError(error, "MCP Request Handler")
         if (!res.headersSent) {
@@ -247,17 +251,6 @@ export class StreamableHttpServer extends BaseTransportServer {
       }
     })
 
-    // Without sessions there is no server-initiated SSE stream (GET) and nothing to terminate
-    // (DELETE). The MCP spec has servers answer both with 405, which clients handle gracefully.
-    this.app.all("/mcp", (_req: Request, res: Response) => {
-      res.setHeader("Allow", "POST")
-      res.status(405).json({
-        jsonrpc: "2.0",
-        error: { code: -32000, message: "Method not allowed: this server is stateless" },
-        id: null,
-      })
-    })
-
     // Add a health check endpoint
     this.app.get("/health", (_req: Request, res: Response) => {
       try {
@@ -266,7 +259,7 @@ export class StreamableHttpServer extends BaseTransportServer {
           status: "ok",
           timestamp: new Date().toISOString(),
           mode: "stateless",
-          activeRequests: this.activeRequests.size,
+          activeRequests: this.activeRequests,
           rateLimit: stats || null,
         })
       } catch (error) {
@@ -280,38 +273,22 @@ export class StreamableHttpServer extends BaseTransportServer {
   }
 
   /**
-   * Handle one MCP POST request with a fresh server and transport.
+   * Handle one MCP request through the SDK's dual-era handler.
    *
-   * Stateful sessions broke the connector: Claude's connector proxy runs on several workers and
-   * sometimes sent requests without a session id (400), and sessions vanished after 30 minutes
-   * idle or on every redeploy (404). Each failure made the client mark the server disconnected.
-   * The Picnic client and its login are process-wide, so nothing per-connection is lost.
+   * Claude's connector now speaks MCP 2026-07-28: it probes with server/discover and sends every
+   * request with a per-request _meta envelope. SDK v1 only knew the 2025 handshake, answered the
+   * probe with "Method not found" and could not serve modern requests, so the connector dropped.
+   * The Picnic client and its login are process-wide, so nothing per-request is lost.
    */
-  private async handlePostRequest(req: Request, res: Response): Promise<void> {
-    const requestedVersion = req.headers["mcp-protocol-version"]
-    this.dropUnsupportedProtocolVersion(req)
-    this.logExchange(req, res, typeof requestedVersion === "string" ? requestedVersion : undefined)
+  private async handleMcpRequest(req: Request, res: Response): Promise<void> {
+    const headerVersion = req.headers["mcp-protocol-version"]
+    this.logExchange(req, res, typeof headerVersion === "string" ? headerVersion : undefined)
 
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true,
-    })
-    // Log why the SDK rejects a request; the access log alone only shows the status code.
-    transport.onerror = (error: Error) => {
-      const method = Array.isArray(req.body) ? "batch" : (req.body?.method ?? "unknown")
-      console.error(`[MCP transport] ${method}: ${error.message}`)
-    }
-    const server = this.createConfiguredServer()
-    const entry = { transport, server }
-    this.activeRequests.add(entry)
-
+    this.activeRequests++
     res.on("close", () => {
-      this.activeRequests.delete(entry)
-      void this.closeQuietly(transport, server)
+      this.activeRequests--
     })
-
-    await server.connect(transport)
-    await transport.handleRequest(req, res, req.body)
+    await this.nodeHandler(req, res, req.method === "POST" ? req.body : undefined)
   }
 
   /**
@@ -322,6 +299,10 @@ export class StreamableHttpServer extends BaseTransportServer {
   private logExchange(req: Request, res: Response, headerVersion: string | undefined): void {
     if (!this.options.enableRequestLogging) return
 
+    if (req.method !== "POST") {
+      res.on("finish", () => console.error(`[MCP] ${req.method} -> ${res.statusCode}`))
+      return
+    }
     const messages: any[] = Array.isArray(req.body) ? req.body : [req.body]
     const describe = (msg: any): string => {
       if (!msg || typeof msg !== "object") return "invalid"
@@ -335,6 +316,9 @@ export class StreamableHttpServer extends BaseTransportServer {
         parts.push(`wants=${msg.params?.protocolVersion ?? "?"}`)
         if (client?.name) parts.push(`client=${client.name}/${client.version ?? "?"}`)
       }
+      // 2026-07-28 requests carry their protocol version in a per-request _meta envelope.
+      const envelopeVersion = msg.params?._meta?.["io.modelcontextprotocol/protocolVersion"]
+      if (typeof envelopeVersion === "string") parts.push(`meta=${envelopeVersion}`)
       if (msg.id !== undefined) parts.push(`id=${msg.id}`)
       return parts.join(" ")
     }
@@ -347,12 +331,15 @@ export class StreamableHttpServer extends BaseTransportServer {
     const capture = (chunk: unknown, encoding?: unknown) => {
       if (chunk === undefined || chunk === null || typeof chunk === "function" || size > limit)
         return
+      // The SDK's Node adapter writes Uint8Array chunks; String() on those is not the body.
       const buf = Buffer.isBuffer(chunk)
         ? chunk
-        : Buffer.from(
-            String(chunk),
-            typeof encoding === "string" ? (encoding as BufferEncoding) : "utf8",
-          )
+        : chunk instanceof Uint8Array
+          ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+          : Buffer.from(
+              String(chunk),
+              typeof encoding === "string" ? (encoding as BufferEncoding) : "utf8",
+            )
       size += buf.length
       chunks.push(buf)
     }
@@ -371,8 +358,16 @@ export class StreamableHttpServer extends BaseTransportServer {
       const details: string[] = []
       if (size > 0 && size <= limit) {
         try {
-          const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"))
-          for (const msg of Array.isArray(parsed) ? parsed : [parsed]) {
+          const body = Buffer.concat(chunks).toString("utf8")
+          // 2025-era requests are answered as an SSE stream; parse its data lines.
+          const payloads = /^(event|data|id|retry):/m.test(body.trimStart().slice(0, 16))
+            ? body
+                .split("\n")
+                .filter((line) => line.startsWith("data:"))
+                .map((line) => JSON.parse(line.slice(5)))
+            : [JSON.parse(body)]
+          const parsed = payloads.flat()
+          for (const msg of parsed) {
             if (msg?.error) {
               details.push(
                 `error=${msg.error.code} ${JSON.stringify(String(msg.error.message ?? ""))}`,
@@ -392,43 +387,6 @@ export class StreamableHttpServer extends BaseTransportServer {
           (details.length ? ` ${details.join(" ")}` : ""),
       )
     })
-  }
-
-  /**
-   * Remove an MCP-Protocol-Version header this SDK does not know.
-   *
-   * The SDK answers such requests with 400, which makes Claude mark the connector disconnected.
-   * A client on a newer protocol revision than the SDK still talks a compatible subset, and a
-   * stateless server has no negotiated version to protect, so the SDK default is used instead.
-   */
-  private dropUnsupportedProtocolVersion(req: Request): void {
-    const version = req.headers["mcp-protocol-version"]
-    if (typeof version !== "string" || SUPPORTED_PROTOCOL_VERSIONS.includes(version)) {
-      return
-    }
-    console.error(`[MCP transport] ignoring unsupported MCP-Protocol-Version: ${version}`)
-    delete req.headers["mcp-protocol-version"]
-    const raw = req.rawHeaders
-    for (let i = raw.length - 2; i >= 0; i -= 2) {
-      if (raw[i].toLowerCase() === "mcp-protocol-version") {
-        raw.splice(i, 2)
-      }
-    }
-  }
-
-  /**
-   * Close a request's transport and server, ignoring errors (the response is already done).
-   */
-  private async closeQuietly(
-    transport: StreamableHTTPServerTransport,
-    server: ReturnType<typeof createMCPServer>,
-  ): Promise<void> {
-    try {
-      await transport.close()
-      await server.close()
-    } catch (error) {
-      ErrorUtils.logError(error, "MCP Request Cleanup")
-    }
   }
 
   /**
@@ -460,12 +418,12 @@ export class StreamableHttpServer extends BaseTransportServer {
   public async stop(): Promise<void> {
     console.error("Stopping HTTP server...")
 
-    // Close the transports of requests still in flight
-    const inFlight = [...this.activeRequests]
-    this.activeRequests.clear()
-    await Promise.allSettled(
-      inFlight.map(({ transport, server }) => this.closeQuietly(transport, server)),
-    )
+    // Abort modern exchanges still in flight and close their per-request servers
+    try {
+      await this.mcpHandler.close()
+    } catch (error) {
+      ErrorUtils.logError(error, "MCP Handler Shutdown")
+    }
 
     // Clean up rate limiter
     if (this.rateLimiter) {

@@ -1,4 +1,4 @@
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
+import { serveStdio } from "@modelcontextprotocol/server/stdio"
 import { BaseTransportServer } from "./base.js"
 
 /**
@@ -9,22 +9,11 @@ export interface StdioServerOptions {
 }
 
 /**
- * Class to handle stdio server setup and configuration using the official MCP stdio transport
+ * Class to handle stdio server setup using the MCP SDK's serveStdio entry, which serves both
+ * 2026-07-28 (server/discover) and 2025-era (initialize) clients from one server factory.
  */
 export class StdioServer extends BaseTransportServer {
-  private mcpServer: ReturnType<typeof import("../utils/server-factory.js").createMCPServer>
-  private transport?: StdioServerTransport
-
-  /**
-   * Create a new stdio server for MCP over stdio
-   *
-   * @param options Configuration options
-   */
-  constructor() {
-    super()
-    // Create MCP server with handlers configured
-    this.mcpServer = this.createConfiguredServer()
-  }
+  private handle?: ReturnType<typeof serveStdio>
 
   /**
    * Start the stdio server
@@ -32,8 +21,9 @@ export class StdioServer extends BaseTransportServer {
    * @returns Promise that resolves when the server is started
    */
   public async start(): Promise<void> {
-    this.transport = new StdioServerTransport()
-    await this.mcpServer.connect(this.transport)
+    this.handle = serveStdio(() => this.createConfiguredServer(), {
+      onerror: (error: Error) => console.error(`[MCP stdio] ${error.message}`),
+    })
     console.error("MCP Server Template running on stdio")
   }
 
@@ -43,9 +33,9 @@ export class StdioServer extends BaseTransportServer {
    * @returns Promise that resolves when the server is stopped
    */
   public async stop(): Promise<void> {
-    if (this.transport) {
-      await this.transport.close()
-      this.transport = undefined
+    if (this.handle) {
+      await this.handle.close()
+      this.handle = undefined
     }
   }
 }

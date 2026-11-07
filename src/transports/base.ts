@@ -1,12 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ListPromptsRequestSchema,
-  GetPromptRequestSchema,
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js"
+import type { McpServer } from "@modelcontextprotocol/server"
 import { toolRegistry } from "../tools/index.js"
 import { promptRegistry } from "../prompts/index.js"
 import { resourceRegistry } from "../resources/index.js"
@@ -33,10 +25,15 @@ export abstract class BaseTransportServer extends EventEmitter {
    * Uses the underlying Server instance for advanced request handler setup.
    */
   protected setupServerHandlers(mcpServer: McpServer): void {
-    const server = mcpServer.server
+    // The registries return loosely typed results (they predate SDK v2's strict result types);
+    // the wire shapes are unchanged, so register through an untyped view of setRequestHandler.
+    const server = mcpServer.server as unknown as {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      setRequestHandler(method: string, handler: (request: any) => Promise<any>): void
+    }
 
     // List tools handler
-    server.setRequestHandler(ListToolsRequestSchema, async () => {
+    server.setRequestHandler("tools/list", async () => {
       try {
         return {
           tools: toolRegistry.getToolsList(),
@@ -50,7 +47,7 @@ export abstract class BaseTransportServer extends EventEmitter {
     })
 
     // List prompts handler
-    server.setRequestHandler(ListPromptsRequestSchema, async () => {
+    server.setRequestHandler("prompts/list", async () => {
       try {
         return {
           prompts: promptRegistry.getPromptsList(),
@@ -65,7 +62,7 @@ export abstract class BaseTransportServer extends EventEmitter {
 
     // Get prompt handler
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    server.setRequestHandler(GetPromptRequestSchema as any, async (request: any) => {
+    server.setRequestHandler("prompts/get", async (request: any) => {
       try {
         const { name, arguments: args } = request.params
 
@@ -107,7 +104,7 @@ export abstract class BaseTransportServer extends EventEmitter {
 
     // Call tool handler
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    server.setRequestHandler(CallToolRequestSchema as any, async (request: any) => {
+    server.setRequestHandler("tools/call", async (request: any) => {
       try {
         const { name, arguments: args } = request.params
 
@@ -155,7 +152,7 @@ export abstract class BaseTransportServer extends EventEmitter {
     })
 
     // List resources handler
-    server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    server.setRequestHandler("resources/list", async () => {
       try {
         return {
           resources: resourceRegistry.getResourcesList(),
@@ -170,7 +167,7 @@ export abstract class BaseTransportServer extends EventEmitter {
 
     // Read resource handler
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    server.setRequestHandler(ReadResourceRequestSchema as any, async (request: any) => {
+    server.setRequestHandler("resources/read", async (request: any) => {
       try {
         const { uri } = request.params
 

@@ -1,7 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { toolRegistry } from "../tools/index.js"
-import { promptRegistry } from "../prompts/index.js"
-import { resourceRegistry } from "../resources/index.js"
+import { McpServer } from "@modelcontextprotocol/server"
 import packageJson from "../../package.json"
 
 export interface ServerConfig {
@@ -18,10 +15,11 @@ export function createMCPServer(config: ServerConfig = {}): McpServer {
   const defaultConfig = {
     name: packageJson.name,
     version: packageJson.version,
+    // Capabilities are flags, not definitions; the lists are served by the request handlers.
     capabilities: {
-      tools: toolRegistry.getToolDefinitions(),
-      prompts: promptRegistry.getPromptDefinitions(),
-      resources: resourceRegistry.getResourceDefinitions(),
+      tools: {},
+      prompts: {},
+      resources: {},
     },
   }
 

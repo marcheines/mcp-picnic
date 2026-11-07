@@ -1,21 +1,11 @@
 import { describe, it, expect, beforeEach, vi, Mock } from "vitest"
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import type { McpServer } from "@modelcontextprotocol/server"
 import { BaseTransportServer } from "../../../src/transports/base.js"
 import { toolRegistry } from "../../../src/tools/index.js"
 import { promptRegistry } from "../../../src/prompts/index.js"
 import { resourceRegistry } from "../../../src/resources/index.js"
 import { ToolError, PromptError, ResourceError, ErrorCode } from "../../../src/types/errors.js"
 import { createMCPServer } from "../../../src/utils/server-factory.js"
-
-// Mock the SDK types
-vi.mock("@modelcontextprotocol/sdk/types.js", () => ({
-  ListToolsRequestSchema: { properties: { method: { const: "tools/list" } } },
-  ListPromptsRequestSchema: { properties: { method: { const: "prompts/list" } } },
-  GetPromptRequestSchema: { properties: { method: { const: "prompts/get" } } },
-  CallToolRequestSchema: { properties: { method: { const: "tools/call" } } },
-  ListResourcesRequestSchema: { properties: { method: { const: "resources/list" } } },
-  ReadResourceRequestSchema: { properties: { method: { const: "resources/read" } } },
-}))
 
 // Mock the registries
 vi.mock("../../../src/tools/index.js", () => ({
@@ -43,9 +33,8 @@ vi.mock("../../../src/utils/server-factory.js", () => ({
   createMCPServer: vi.fn(() => {
     const handlers = new Map()
     const mockServer = {
-      setRequestHandler: vi.fn((schema: any, handler: any) => {
-        const key = schema.properties.method.const
-        handlers.set(key, handler)
+      setRequestHandler: vi.fn((method: string, handler: any) => {
+        handlers.set(method, handler)
       }),
       getHandler: (key: string) => handlers.get(key),
       connect: vi.fn(),

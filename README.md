@@ -465,6 +465,11 @@ issued or required. Connections therefore survive redeploys, idle periods and cl
 requests over several workers. `GET` and `DELETE` on `/mcp` answer `405`, as the MCP spec allows
 for servers without a server-initiated event stream.
 
+The server is built on MCP TypeScript SDK v2 and speaks both protocol eras on the same endpoint:
+2026-07-28 clients (a `server/discover` probe, then requests carrying a per-request `_meta`
+envelope) and 2025-era clients (the `initialize` handshake). Claude's connector uses 2026-07-28;
+SDK v1 answered its probe with "Method not found", which made the connector drop.
+
 ### MCP Client Configuration
 
 #### Claude Desktop
