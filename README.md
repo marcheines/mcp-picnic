@@ -398,6 +398,11 @@ HTTP_HOST=0.0.0.0
 HTTP_AUTH_TOKEN=replace-with-a-long-random-token
 # Optional: HTTP header name to accept token auth (default: x-mcp-token)
 HTTP_AUTH_HEADER_NAME=x-mcp-token
+# Optional: rate limit per client IP (defaults: 1000 requests per 15 minutes)
+HTTP_RATE_LIMIT_MAX_REQUESTS=1000
+HTTP_RATE_LIMIT_WINDOW_MS=900000
+# Optional: per-request timeout in ms (default: 30000)
+HTTP_REQUEST_TIMEOUT_MS=30000
 
 # Session persistence (optional, strongly recommended in containers)
 PICNIC_SESSION_FILE=~/.picnic-session.json

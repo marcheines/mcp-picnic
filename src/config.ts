@@ -27,6 +27,20 @@ const configSchema = z.object({
   HTTP_HOST: z.string().default("localhost"),
   HTTP_AUTH_TOKEN: z.string().optional(),
   HTTP_AUTH_HEADER_NAME: z.string().default("x-mcp-token"),
+  // Max requests per client IP per window. A weekly meal plan (searches + ~30 cart adds) needs headroom.
+  HTTP_RATE_LIMIT_MAX_REQUESTS: z
+    .string()
+    .transform((val) => parseInt(val, 10))
+    .default("1000"),
+  HTTP_RATE_LIMIT_WINDOW_MS: z
+    .string()
+    .transform((val) => parseInt(val, 10))
+    .default(String(15 * 60 * 1000)),
+  // Per-request timeout; Picnic API calls (recipes, multi-item operations) can exceed 10s.
+  HTTP_REQUEST_TIMEOUT_MS: z
+    .string()
+    .transform((val) => parseInt(val, 10))
+    .default("30000"),
   PICNIC_SESSION_FILE: z.string().default(defaultSessionFile),
 })
 

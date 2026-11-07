@@ -19,6 +19,11 @@ async function runServer() {
       host: config.HTTP_HOST,
       authToken: config.HTTP_AUTH_TOKEN,
       authHeaderName: config.HTTP_AUTH_HEADER_NAME,
+      rateLimitConfig: {
+        windowMs: config.HTTP_RATE_LIMIT_WINDOW_MS,
+        maxRequests: config.HTTP_RATE_LIMIT_MAX_REQUESTS,
+      },
+      requestTimeoutMs: config.HTTP_REQUEST_TIMEOUT_MS,
     })
 
     // Handle graceful shutdown for HTTP server
