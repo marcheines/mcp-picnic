@@ -450,11 +450,20 @@ When `HTTP_AUTH_TOKEN` is set, all HTTP endpoints except `/health` require authe
 Example requests:
 
 ```bash
-curl -H "x-mcp-token: YOUR_TOKEN" "http://localhost:3000/mcp"
-curl -H "Authorization: Bearer YOUR_TOKEN" "http://localhost:3000/sessions"
+curl -H "x-mcp-token: YOUR_TOKEN" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "http://localhost:3000/mcp"
+curl -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "http://localhost:3000/mcp"
 ```
 
 If the token is missing or invalid, the server responds with `401 Unauthorized`.
+
+#### Stateless HTTP transport
+
+The HTTP server is stateless: every `POST /mcp` is handled on its own and no `mcp-session-id` is
+issued or required. Connections therefore survive redeploys, idle periods and clients that spread
+requests over several workers. `GET` and `DELETE` on `/mcp` answer `405`, as the MCP spec allows
+for servers without a server-initiated event stream.
 
 ### MCP Client Configuration
 

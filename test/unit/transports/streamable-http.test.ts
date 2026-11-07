@@ -9,36 +9,22 @@ import { createMCPServer } from "../../../src/utils/server-factory"
 // Mock dependencies
 vi.mock("../../../src/utils/server-factory")
 vi.mock("crypto", () => ({
-  randomUUID: vi.fn(() => "test-session-id"),
   timingSafeEqual: vi.fn((a: Buffer, b: Buffer) => Buffer.compare(a, b) === 0),
 }))
 
-const mockTransport = {
-  sessionId: "test-session-id",
-  close: vi.fn().mockResolvedValue(undefined),
-  onclose: undefined,
-  handleRequest: vi.fn().mockResolvedValue(undefined),
-}
+const transportOptions: unknown[] = []
 
 vi.mock("@modelcontextprotocol/sdk/server/streamableHttp.js", () => ({
-  StreamableHTTPServerTransport: vi.fn().mockImplementation((options) => {
-    const transport = {
-      ...mockTransport,
-      sessionId: "test-session-id",
-      close: vi.fn().mockResolvedValue(undefined),
-      onclose: undefined,
-      handleRequest: vi.fn().mockResolvedValue(undefined),
+  // A plain class: vi.restoreAllMocks() in afterEach would strip a vi.fn() implementation.
+  StreamableHTTPServerTransport: class {
+    constructor(options: unknown) {
+      transportOptions.push(options)
     }
-
-    if (options?.onsessioninitialized) {
-      const sessionId = options.sessionIdGenerator
-        ? options.sessionIdGenerator()
-        : transport.sessionId
-      transport.sessionId = sessionId
-      options.onsessioninitialized(sessionId)
+    async close() {}
+    async handleRequest(_req: unknown, res: { status: (n: number) => any }) {
+      res.status(200).json({ jsonrpc: "2.0", id: 1, result: {} })
     }
-    return transport
-  }),
+  },
 }))
 
 describe("StreamableHttpServer", () => {
@@ -129,31 +115,6 @@ describe("StreamableHttpServer", () => {
     expect(closeSpy).toHaveBeenCalled()
   })
 
-  it("should cleanup sessions on stop", async () => {
-    server = new StreamableHttpServer()
-    vi.spyOn(http.Server.prototype, "listen").mockImplementation(function (
-      this: any,
-      _port: any,
-      callback: any,
-    ) {
-      if (callback) callback()
-      return this
-    })
-    vi.spyOn(http.Server.prototype, "close").mockImplementation(function (
-      this: any,
-      callback: any,
-    ) {
-      if (callback) callback()
-      return this
-    })
-
-    await server.start()
-    await server.createNewSession()
-    await server.stop()
-
-    expect(server.getActiveSessions()).toHaveLength(0)
-  })
-
   it("should provide a health check", async () => {
     vi.useRealTimers()
     server = new StreamableHttpServer({ port: 0, enableRequestLogging: false })
@@ -180,12 +141,7 @@ describe("StreamableHttpServer", () => {
 
     expect(res.statusCode).toBe(200)
     expect(res.body).toEqual(
-      expect.objectContaining({
-        sessions: {
-          active: 0,
-          max: 100,
-        },
-      }),
+      expect.objectContaining({ status: "ok", mode: "stateless", activeRequests: 0 }),
     )
   })
 
@@ -235,7 +191,7 @@ describe("StreamableHttpServer", () => {
 
     const res = await new Promise<{ statusCode: number; body: any }>((resolve, reject) => {
       const req = http.request(
-        { hostname: "127.0.0.1", port: address.port, path: "/sessions", method: "GET" },
+        { hostname: "127.0.0.1", port: address.port, path: "/mcp", method: "GET" },
         (response) => {
           let data = ""
           response.on("data", (chunk: string) => (data += chunk))
@@ -323,7 +279,7 @@ describe("StreamableHttpServer", () => {
         {
           hostname: "127.0.0.1",
           port: address.port,
-          path: "/sessions",
+          path: "/mcp",
           method: "GET",
           headers: { "x-api-token": "wrong" },
         },
@@ -360,7 +316,7 @@ describe("StreamableHttpServer", () => {
         {
           hostname: "127.0.0.1",
           port: address.port,
-          path: "/sessions",
+          path: "/mcp",
           method: "GET",
           headers: { "x-api-token": "secret" },
         },
@@ -375,7 +331,7 @@ describe("StreamableHttpServer", () => {
       req.end()
     })
 
-    expect(sessionsRes.statusCode).toBe(200)
+    expect(sessionsRes.statusCode).toBe(405)
   })
 
   it("should allow authorization bearer token authentication", async () => {
@@ -392,7 +348,7 @@ describe("StreamableHttpServer", () => {
         {
           hostname: "127.0.0.1",
           port: address.port,
-          path: "/sessions",
+          path: "/mcp",
           method: "GET",
           headers: { Authorization: "Bearer secret" },
         },
@@ -407,42 +363,10 @@ describe("StreamableHttpServer", () => {
       req.end()
     })
 
-    expect(sessionsRes.statusCode).toBe(200)
+    expect(sessionsRes.statusCode).toBe(405)
   })
 
-  it("should not recurse when transport close fires onclose during session cleanup", () => {
-    server = new StreamableHttpServer({ enableRequestLogging: false })
-    const sessionId = "regression-session"
-
-    const transport: {
-      sessionId: string
-      closeCalls: number
-      onclose?: () => void
-      close: () => void
-    } = {
-      sessionId,
-      closeCalls: 0,
-      close() {
-        this.closeCalls++
-        this.onclose?.()
-      },
-    }
-
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        server.cleanupSession(transport.sessionId)
-      }
-    }
-
-    // @ts-expect-error - private property access
-    server.transports[sessionId] = transport
-
-    expect(() => server.cleanupSession(sessionId)).not.toThrow()
-    expect(transport.closeCalls).toBe(1)
-    expect(server.getActiveSessions()).toEqual([])
-  })
-
-  describe("session errors", () => {
+  describe("stateless MCP endpoint", () => {
     async function request(
       method: string,
       headers: Record<string, string>,
@@ -472,29 +396,44 @@ describe("StreamableHttpServer", () => {
 
     beforeEach(async () => {
       vi.useRealTimers()
+      transportOptions.length = 0
       server = new StreamableHttpServer({ port: 0, enableRequestLogging: false })
       await server.start()
     })
 
-    it.each(["POST", "GET", "DELETE"])(
-      "answers %s with an unknown session id with 404 instead of 500",
-      async (method) => {
-        const res = await request(
-          method,
-          { "Content-Type": "application/json", "mcp-session-id": "does-not-exist" },
-          method === "POST" ? toolsList : undefined,
-        )
-
-        expect(res.statusCode).toBe(404)
-        expect(res.body.jsonrpc).toBe("2.0")
-        expect(res.body.error.message).toMatch(/Session not found/)
-      },
-    )
-
-    it("answers a non-initialize POST without session id with 400", async () => {
+    it("handles a non-initialize POST without session id", async () => {
       const res = await request("POST", { "Content-Type": "application/json" }, toolsList)
 
-      expect(res.statusCode).toBe(400)
+      expect(res.statusCode).toBe(200)
+      expect(transportOptions[0]).toEqual({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+      })
+    })
+
+    it("handles a POST carrying a stale session id from before a redeploy", async () => {
+      const res = await request(
+        "POST",
+        { "Content-Type": "application/json", "mcp-session-id": "from-old-deployment" },
+        toolsList,
+      )
+
+      expect(res.statusCode).toBe(200)
+    })
+
+    it("uses a fresh transport and server for every request", async () => {
+      await request("POST", { "Content-Type": "application/json" }, toolsList)
+      await request("POST", { "Content-Type": "application/json" }, toolsList)
+
+      expect(transportOptions).toHaveLength(2)
+      expect(mockSDKServer.connect).toHaveBeenCalledTimes(2)
+    })
+
+    it.each(["GET", "DELETE"])("answers %s with 405", async (method) => {
+      const res = await request(method, {})
+
+      expect(res.statusCode).toBe(405)
+      expect(res.body.jsonrpc).toBe("2.0")
     })
   })
 })

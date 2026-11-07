@@ -36,11 +36,12 @@ const configSchema = z.object({
     .string()
     .transform((val) => parseInt(val, 10))
     .default(String(15 * 60 * 1000)),
-  // Per-request timeout; Picnic API calls (recipes, multi-item operations) can exceed 10s.
+  // Per-request timeout; kept above the 60s tool timeout so slow Picnic calls finish with a
+  // proper tool result instead of an HTTP 408.
   HTTP_REQUEST_TIMEOUT_MS: z
     .string()
     .transform((val) => parseInt(val, 10))
-    .default("30000"),
+    .default("75000"),
   PICNIC_SESSION_FILE: z.string().default(defaultSessionFile),
 })
 
