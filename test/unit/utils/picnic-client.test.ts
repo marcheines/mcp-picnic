@@ -112,10 +112,7 @@ describe("picnic-client session persistence", () => {
       expect(() => getPicnicClient()).not.toThrow()
       // The device-id resolver may persist a generated id, but no session
       // should be written while 2FA is still pending.
-      expect(fs.writeFile).not.toHaveBeenCalledWith(
-        "picnic-session.json",
-        expect.anything(),
-      )
+      expect(fs.writeFile).not.toHaveBeenCalledWith("picnic-session.json", expect.anything())
     })
 
     it("should keep running when login throws a TOTP wording variant", async () => {
@@ -126,10 +123,7 @@ describe("picnic-client session persistence", () => {
 
       await expect(initializePicnicClient()).resolves.toBeUndefined()
       expect(() => getPicnicClient()).not.toThrow()
-      expect(fs.writeFile).not.toHaveBeenCalledWith(
-        "picnic-session.json",
-        expect.anything(),
-      )
+      expect(fs.writeFile).not.toHaveBeenCalledWith("picnic-session.json", expect.anything())
     })
 
     it("should keep running when login throws a structured 2FA error", async () => {
@@ -140,10 +134,7 @@ describe("picnic-client session persistence", () => {
 
       await expect(initializePicnicClient()).resolves.toBeUndefined()
       expect(() => getPicnicClient()).not.toThrow()
-      expect(fs.writeFile).not.toHaveBeenCalledWith(
-        "picnic-session.json",
-        expect.anything(),
-      )
+      expect(fs.writeFile).not.toHaveBeenCalledWith("picnic-session.json", expect.anything())
     })
 
     it("should not re-initialize if already initialized", async () => {
@@ -156,6 +147,78 @@ describe("picnic-client session persistence", () => {
       await initializePicnicClient()
 
       expect(mockLogin).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe("PICNIC_AUTH_KEY fallback", () => {
+    async function withConfig(overrides: Record<string, unknown>) {
+      const { config } = await import("../../../src/config.js")
+      Object.assign(config, overrides)
+      return () => {
+        for (const key of Object.keys(overrides)) delete (config as any)[key]
+      }
+    }
+
+    it("reuses PICNIC_AUTH_KEY when no session file exists", async () => {
+      const restore = await withConfig({ PICNIC_AUTH_KEY: "env-key" })
+      try {
+        vi.mocked(fs.readFile).mockRejectedValue(new Error("ENOENT"))
+        mockGetCart.mockResolvedValue({})
+        const PicnicClient = (await import("picnic-api")).default
+
+        const { initializePicnicClient } = await importClient()
+        await initializePicnicClient()
+
+        expect(vi.mocked(PicnicClient)).toHaveBeenCalledWith(
+          expect.objectContaining({ authKey: "env-key" }),
+        )
+        expect(mockLogin).not.toHaveBeenCalled()
+      } finally {
+        restore()
+      }
+    })
+
+    it("prefers the session file over PICNIC_AUTH_KEY", async () => {
+      const restore = await withConfig({ PICNIC_AUTH_KEY: "env-key" })
+      try {
+        vi.mocked(fs.readFile).mockImplementation(async (file: any) => {
+          if (file === "picnic-session.json") return JSON.stringify({ authKey: "file-key" })
+          throw new Error("ENOENT")
+        })
+        mockGetCart.mockResolvedValue({})
+        const PicnicClient = (await import("picnic-api")).default
+
+        const { initializePicnicClient } = await importClient()
+        await initializePicnicClient()
+
+        expect(vi.mocked(PicnicClient)).toHaveBeenCalledWith(
+          expect.objectContaining({ authKey: "file-key" }),
+        )
+      } finally {
+        restore()
+      }
+    })
+
+    it("logs the credentials only when PICNIC_LOG_CREDENTIALS is enabled", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+      vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify({ authKey: "secret-key" }))
+      mockGetCart.mockResolvedValue({})
+
+      let client = await importClient()
+      await client.initializePicnicClient()
+      expect(errorSpy.mock.calls.flat().join("\n")).not.toContain("secret-key")
+
+      const restore = await withConfig({ PICNIC_LOG_CREDENTIALS: true })
+      try {
+        vi.resetModules()
+        errorSpy.mockClear()
+        client = await importClient()
+        await client.initializePicnicClient()
+        expect(errorSpy.mock.calls.flat().join("\n")).toContain("PICNIC_AUTH_KEY=secret-key")
+      } finally {
+        restore()
+        errorSpy.mockRestore()
+      }
     })
   })
 

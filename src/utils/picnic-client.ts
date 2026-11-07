@@ -65,21 +65,56 @@ function isTwoFactorAuthenticationError(error: unknown): boolean {
   )
 }
 
-async function loadSession(): Promise<string | null> {
+/**
+ * Load the auth key to reuse.
+ *
+ * The session file wins: it is written after every login, so it is newer than the configured
+ * key whenever it exists. Without a persistent volume the file is gone after a redeploy, and
+ * PICNIC_AUTH_KEY keeps the server logged in without a fresh login (and possibly 2FA).
+ */
+async function loadSession(): Promise<{ authKey: string; source: "file" | "env" } | null> {
   try {
     const data = await fs.readFile(config.PICNIC_SESSION_FILE, "utf-8")
     const session = JSON.parse(data)
-    return session.authKey || null
+    if (session.authKey) {
+      return { authKey: session.authKey, source: "file" }
+    }
   } catch {
-    return null
+    // No session file; fall back to the configured key.
   }
+  if (config.PICNIC_AUTH_KEY) {
+    return { authKey: config.PICNIC_AUTH_KEY, source: "env" }
+  }
+  return null
+}
+
+/**
+ * Log the credentials needed to run without a volume, but only when explicitly enabled.
+ */
+function logCredentials(authKey: string | null | undefined, deviceId?: string): void {
+  if (!config.PICNIC_LOG_CREDENTIALS) return
+  if (authKey) console.error(`[credentials] PICNIC_AUTH_KEY=${authKey}`)
+  if (deviceId) console.error(`[credentials] PICNIC_DEVICE_ID=${deviceId}`)
+  console.error("[credentials] Set PICNIC_LOG_CREDENTIALS=false again once copied.")
 }
 
 export async function saveSession(): Promise<void> {
   if (!picnicClientInstance) return
   const authKey = picnicClientInstance.authKey
   if (authKey) {
-    await fs.writeFile(config.PICNIC_SESSION_FILE, JSON.stringify({ authKey }))
+    try {
+      await fs.writeFile(config.PICNIC_SESSION_FILE, JSON.stringify({ authKey }))
+    } catch (error) {
+      // Not fatal: the key stays in memory for this run.
+      console.error(`Could not write session file: ${(error as Error).message}`)
+    }
+    if (authKey !== config.PICNIC_AUTH_KEY) {
+      console.error(
+        "New Picnic auth key obtained. Update PICNIC_AUTH_KEY so it survives a redeploy " +
+          "(set PICNIC_LOG_CREDENTIALS=true to print it).",
+      )
+      logCredentials(authKey)
+    }
   }
 }
 
@@ -145,7 +180,8 @@ export async function initializePicnicClient(
   const loginPassword = password || config.PICNIC_PASSWORD
   const loginCountryCode = countryCode || config.PICNIC_COUNTRY_CODE
 
-  const savedAuthKey = await loadSession()
+  const savedSession = await loadSession()
+  const savedAuthKey = savedSession?.authKey ?? null
   const deviceId = await resolveDeviceId()
 
   const clientOptions: PicnicClientOptions = {
@@ -159,10 +195,11 @@ export async function initializePicnicClient(
 
   if (savedAuthKey) {
     try {
-      console.error("Testing saved auth key...")
+      console.error(`Testing saved auth key (from ${savedSession!.source})...`)
       await client.cart.getCart()
       picnicClientInstance = client
       console.error("Successfully reused saved session.")
+      logCredentials(savedAuthKey, deviceId)
       return
     } catch {
       console.error("Saved session invalid, performing fresh login...")
@@ -182,6 +219,7 @@ export async function initializePicnicClient(
     }
 
     await saveSession()
+    logCredentials(null, deviceId)
     console.error("Picnic client initialized successfully.")
   } catch (error) {
     if (isTwoFactorAuthenticationError(error)) {

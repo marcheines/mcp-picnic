@@ -546,6 +546,8 @@ If your Picnic account has 2FA enabled, complete the verification flow using MCP
 > Important: In Docker, the server itself cannot "chat" or type the code for you. Your MCP client (Claude Desktop, Continue, etc.) must trigger these tools.
 
 To avoid repeated 2FA challenges and container restart loops, persist `PICNIC_SESSION_FILE` to a Docker volume.
+
+Alternatively, run without a volume by setting `PICNIC_AUTH_KEY` (and `PICNIC_DEVICE_ID`). The key is used whenever no session file exists, so a redeploy needs no new login. On hosts like Railway, a service with a volume is stopped before its replacement starts; without a volume, redeploys cause no downtime. To get the current values, set `PICNIC_LOG_CREDENTIALS=true` once: the server prints both at startup and after every login. Turn it off again afterwards. When a login yields a new key, the server logs a reminder to update `PICNIC_AUTH_KEY`.
 When 2FA is pending, the server stays up so your client can complete `picnic_generate_2fa_code` and `picnic_verify_2fa_code`.
 
 **Security Note**: Credentials are used only for Picnic API authentication. The session token is stored locally at `PICNIC_SESSION_FILE`; the password is never stored on disk.

@@ -459,6 +459,28 @@ describe("StreamableHttpServer", () => {
       expect(seenHeaders[0].headers["mcp-protocol-version"]).toBe("2025-06-18")
     })
 
+    it("logs method, tool name, versions and JSON-RPC errors per request", async () => {
+      await server.stop()
+      server = new StreamableHttpServer({ port: 0, enableRequestLogging: true })
+      await server.start()
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+      await request(
+        "POST",
+        { "Content-Type": "application/json", "MCP-Protocol-Version": "2099-01-01" },
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 7,
+          method: "tools/call",
+          params: { name: "picnic_clear_cart", arguments: { secret: "do-not-log" } },
+        }),
+      )
+
+      const logged = errorSpy.mock.calls.flat().join("\n")
+      expect(logged).toContain("[MCP] tools/call(picnic_clear_cart) id=7 hdr=2099-01-01 -> 200")
+      expect(logged).not.toContain("do-not-log")
+    })
+
     it.each(["GET", "DELETE"])("answers %s with 405", async (method) => {
       const res = await request(method, {})
 

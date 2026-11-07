@@ -288,7 +288,9 @@ export class StreamableHttpServer extends BaseTransportServer {
    * The Picnic client and its login are process-wide, so nothing per-connection is lost.
    */
   private async handlePostRequest(req: Request, res: Response): Promise<void> {
+    const requestedVersion = req.headers["mcp-protocol-version"]
     this.dropUnsupportedProtocolVersion(req)
+    this.logExchange(req, res, typeof requestedVersion === "string" ? requestedVersion : undefined)
 
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
@@ -310,6 +312,86 @@ export class StreamableHttpServer extends BaseTransportServer {
 
     await server.connect(transport)
     await transport.handleRequest(req, res, req.body)
+  }
+
+  /**
+   * Log one line per MCP request: JSON-RPC method(s), tool name, protocol versions, HTTP status
+   * and any JSON-RPC error in the response. The access log only shows "POST /mcp 200", which
+   * cannot tell a failed handshake from a successful one. Tool arguments are never logged.
+   */
+  private logExchange(req: Request, res: Response, headerVersion: string | undefined): void {
+    if (!this.options.enableRequestLogging) return
+
+    const messages: any[] = Array.isArray(req.body) ? req.body : [req.body]
+    const describe = (msg: any): string => {
+      if (!msg || typeof msg !== "object") return "invalid"
+      const method = typeof msg.method === "string" ? msg.method : "response"
+      const parts = [method]
+      if (method === "tools/call" && typeof msg.params?.name === "string") {
+        parts[0] = `tools/call(${msg.params.name})`
+      }
+      if (method === "initialize") {
+        const client = msg.params?.clientInfo
+        parts.push(`wants=${msg.params?.protocolVersion ?? "?"}`)
+        if (client?.name) parts.push(`client=${client.name}/${client.version ?? "?"}`)
+      }
+      if (msg.id !== undefined) parts.push(`id=${msg.id}`)
+      return parts.join(" ")
+    }
+    const summary = messages.map(describe).join(" | ")
+
+    // Capture the response body (JSON, small) to report JSON-RPC errors and the negotiated version.
+    const chunks: Buffer[] = []
+    let size = 0
+    const limit = 64 * 1024
+    const capture = (chunk: unknown, encoding?: unknown) => {
+      if (chunk === undefined || chunk === null || typeof chunk === "function" || size > limit)
+        return
+      const buf = Buffer.isBuffer(chunk)
+        ? chunk
+        : Buffer.from(
+            String(chunk),
+            typeof encoding === "string" ? (encoding as BufferEncoding) : "utf8",
+          )
+      size += buf.length
+      chunks.push(buf)
+    }
+    const originalWrite = res.write.bind(res) as (...args: any[]) => boolean
+    const originalEnd = res.end.bind(res) as (...args: any[]) => Response
+    res.write = ((...args: any[]) => {
+      capture(args[0], args[1])
+      return originalWrite(...args)
+    }) as typeof res.write
+    res.end = ((...args: any[]) => {
+      capture(args[0], args[1])
+      return originalEnd(...args)
+    }) as typeof res.end
+
+    res.on("finish", () => {
+      const details: string[] = []
+      if (size > 0 && size <= limit) {
+        try {
+          const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+          for (const msg of Array.isArray(parsed) ? parsed : [parsed]) {
+            if (msg?.error) {
+              details.push(
+                `error=${msg.error.code} ${JSON.stringify(String(msg.error.message ?? ""))}`,
+              )
+            }
+            if (msg?.result?.protocolVersion) {
+              details.push(`negotiated=${msg.result.protocolVersion}`)
+            }
+            if (msg?.result?.isError) details.push("toolError")
+          }
+        } catch {
+          details.push("non-json response")
+        }
+      }
+      console.error(
+        `[MCP] ${summary} hdr=${headerVersion ?? "-"} -> ${res.statusCode}` +
+          (details.length ? ` ${details.join(" ")}` : ""),
+      )
+    })
   }
 
   /**

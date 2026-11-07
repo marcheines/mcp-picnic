@@ -43,6 +43,15 @@ const configSchema = z.object({
     .transform((val) => parseInt(val, 10))
     .default("75000"),
   PICNIC_SESSION_FILE: z.string().default(defaultSessionFile),
+  // Picnic auth key used when no session file exists (e.g. on a host without a persistent
+  // volume). Lets deployments run without a volume, so a redeploy causes no downtime.
+  PICNIC_AUTH_KEY: z.string().optional(),
+  // When "true", print the auth key and device id to the log at startup and after a login, so
+  // they can be copied into PICNIC_AUTH_KEY / PICNIC_DEVICE_ID. Turn it off again afterwards.
+  PICNIC_LOG_CREDENTIALS: z
+    .string()
+    .transform((val) => val === "true")
+    .default("false"),
 })
 
 export const config = configSchema.parse(process.env)
