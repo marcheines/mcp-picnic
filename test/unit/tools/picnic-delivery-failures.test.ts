@@ -4,6 +4,7 @@ import {
   filterDeliveryData,
   readDeliveryFailures,
   readRefundedItems,
+  refundsToDeliveryFailures,
 } from "../../../src/tools/picnic-tools.js"
 
 const delivery = {
@@ -121,5 +122,27 @@ describe("readRefundedItems", () => {
 
   it("returns an empty list without refunds", () => {
     expect(readRefundedItems(null)).toEqual([])
+  })
+})
+
+describe("refundsToDeliveryFailures", () => {
+  it("matches wallet refunds to order lines by product name", () => {
+    const failures = refundsToDeliveryFailures(filterDeliveryData(delivery), [
+      {
+        product_id: "13501890",
+        name: "Caramelle",
+        quantity: 2,
+        refund: 670,
+        reason: "PRODUCT_NOT_SHIPPED",
+      },
+      { product_id: "99", name: "Nicht bestellt", quantity: 1, refund: 50 },
+    ])
+    expect([...failures.get("o1")!.entries()]).toEqual([
+      ["656_657", { reasons: ["PRODUCT_NOT_SHIPPED"], failed_count: 2, refund: 670 }],
+    ])
+  })
+
+  it("returns nothing without refunds", () => {
+    expect(refundsToDeliveryFailures(filterDeliveryData(delivery), []).size).toBe(0)
   })
 })

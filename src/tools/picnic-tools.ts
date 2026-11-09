@@ -307,6 +307,89 @@ export function addDeliveryFailures(
   return notDelivered.length ? { ...delivery, orders, not_delivered: notDelivered } : delivery
 }
 
+type RefundedItem = ReturnType<typeof readRefundedItems>[number]
+
+const DAY_MS = 24 * 60 * 60 * 1000
+/** Most wallet transactions whose details are fetched for one delivery. */
+const MAX_WALLET_LOOKUPS = 8
+
+/**
+ * Collects the products refunded without a replacement for one delivery from the wallet. The
+ * wallet list has no delivery id, so the transactions paid between 3 days before and 14 days
+ * after the delivery window are fetched and kept when their `delivery_id` matches. Failures are
+ * non-fatal: the delivery is then returned without refunds.
+ */
+async function fetchWalletRefunds(
+  client: PicnicClientInstance,
+  deliveryId: string,
+  windowStart: string | null | undefined,
+): Promise<RefundedItem[]> {
+  const start = windowStart ? Date.parse(windowStart) : NaN
+  if (!Number.isFinite(start)) return []
+  const from = start - 3 * DAY_MS
+  const to = start + 14 * DAY_MS
+  try {
+    const candidates: string[] = []
+    for (let page = 1; page <= 3; page++) {
+      const list = asRecords(
+        await client.sendRequest<{ page_number: number }, unknown>("POST", "/wallet/transactions", {
+          page_number: page,
+        }),
+      )
+      for (const tx of list) {
+        const ts = typeof tx.timestamp === "number" ? tx.timestamp : NaN
+        if (typeof tx.id === "string" && ts >= from && ts <= to) candidates.push(tx.id)
+      }
+      // The list is newest first: stop once the page reaches back past the window.
+      const oldest = list.at(-1)?.timestamp
+      if (list.length === 0 || (typeof oldest === "number" && oldest < from)) break
+    }
+    const details = await Promise.all(
+      candidates
+        .slice(0, MAX_WALLET_LOOKUPS)
+        .map((id) =>
+          client
+            .sendRequest<null, unknown>("GET", `/wallet/transactions/${encodeURIComponent(id)}`)
+            .catch(() => null),
+        ),
+    )
+    return details
+      .filter((raw) => asRecord(raw)?.delivery_id === deliveryId)
+      .flatMap((raw) => readRefundedItems(raw))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Turns wallet refunds into {@link DeliveryFailure}s keyed like {@link readDeliveryFailures}.
+ * Wallet and delivery use different product ids, so refunds are matched to order lines by
+ * product name; each refund is used once.
+ */
+export function refundsToDeliveryFailures(
+  delivery: ReturnType<typeof filterDeliveryData>,
+  refunds: RefundedItem[],
+): Map<string, Map<string, DeliveryFailure>> {
+  const result = new Map<string, Map<string, DeliveryFailure>>()
+  const remaining = [...refunds]
+  for (const order of delivery.orders) {
+    for (const item of order.items) {
+      const names = new Set(item.articles.map((article) => article.name))
+      const index = remaining.findIndex((refund) => refund.name && names.has(refund.name))
+      if (index === -1) continue
+      const [refund] = remaining.splice(index, 1)
+      const lines = result.get(order.order_id) ?? new Map<string, DeliveryFailure>()
+      lines.set(String(item.order_line_id), {
+        reasons: refund.reason ? [refund.reason] : [],
+        failed_count: refund.quantity,
+        ...(refund.refund != null && { refund: refund.refund }),
+      })
+      result.set(order.order_id, lines)
+    }
+  }
+  return result
+}
+
 /**
  * Reads the products a wallet transaction refunded without a replacement (cancelled or missing
  * products) from the raw transaction. picnic-api only keeps refunds that have substitutions.
@@ -2392,9 +2475,17 @@ toolRegistry.register({
       fetchRawDelivery(client, args.deliveryId),
     ])
     const eta = toEtaWindow(raw?.eta2)
+    const filtered = filterDeliveryData(delivery)
+    // Picnic's own failure markers when the raw delivery has them; otherwise the refunds the
+    // wallet booked for this delivery (only completed deliveries have been charged).
+    let failures = readDeliveryFailures(raw)
+    if (failures.size === 0 && filtered.status === "COMPLETED") {
+      const refunds = await fetchWalletRefunds(client, args.deliveryId, filtered.window_start)
+      failures = refundsToDeliveryFailures(filtered, refunds)
+    }
     const { id, status, window_start, window_end, ...rest } = addDeliveryFailures(
-      filterDeliveryData(delivery),
-      readDeliveryFailures(raw),
+      filtered,
+      failures,
     )
     return {
       id,

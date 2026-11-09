@@ -448,3 +448,73 @@ describe("narrowed delivery window (eta2)", () => {
     ).rejects.toThrow(/network down/)
   })
 })
+
+describe("picnic_get_delivery with wallet refunds", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.initializePicnicClient.mockResolvedValue(undefined)
+  })
+
+  it("marks products the wallet refunded for this delivery as not delivered", async () => {
+    const windowStart = "2026-11-09T15:00:00.000+01:00"
+    mocks.getDelivery.mockResolvedValue({
+      id: "d1",
+      status: "COMPLETED",
+      windowStart,
+      windowEnd: "2026-11-09T17:30:00.000+01:00",
+      totalPrice: 670,
+      totalCount: 2,
+      returnedContainers: [],
+      cancellable: false,
+      orders: [
+        {
+          id: "o1",
+          status: "COMPLETED",
+          creationTime: "2026-11-07T18:56:26.422+01:00",
+          checkoutTotalPrice: 670,
+          items: [
+            { id: "656_657", productId: "s2", name: "Caramelle", displayPrice: 670, quantity: 2 },
+          ],
+        },
+      ],
+    })
+    const paid = Date.parse(windowStart)
+    mocks.sendRequest.mockImplementation(async (method: string, path: string) => {
+      if (path === "/deliveries/d1") return { orders: [] }
+      if (method === "POST" && path === "/wallet/transactions") {
+        return [
+          { id: "t1", timestamp: paid },
+          { id: "t2", timestamp: paid },
+          { id: "old", timestamp: paid - 30 * 24 * 60 * 60 * 1000 },
+        ]
+      }
+      if (path === "/wallet/transactions/t1") {
+        return {
+          delivery_id: "d1",
+          shop_items: [{ items: [{ id: "13501890", name: "Caramelle" }] }],
+          article_issue_refunds: [
+            { article_id: "13501890", quantity: 2, amount: 670, reason: "PRODUCT_NOT_SHIPPED" },
+          ],
+        }
+      }
+      if (path === "/wallet/transactions/t2") return { delivery_id: "other" }
+      throw new Error(`unexpected ${method} ${path}`)
+    })
+    const toolRegistry = await loadTools()
+
+    const payload = parseToolResult(
+      await toolRegistry.executeTool("picnic_get_delivery", { deliveryId: "d1" }),
+    )
+
+    expect(payload.not_delivered).toEqual([
+      {
+        order_id: "o1",
+        name: "Caramelle",
+        reasons: ["PRODUCT_NOT_SHIPPED"],
+        failed_count: 2,
+        refund: 670,
+      },
+    ])
+    expect(mocks.sendRequest).not.toHaveBeenCalledWith("GET", "/wallet/transactions/old")
+  })
+})
