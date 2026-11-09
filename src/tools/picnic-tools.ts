@@ -178,28 +178,166 @@ export function toEtaWindow(eta2: unknown): EtaWindow | null {
 }
 
 /**
- * Fetches the narrowed delivery window of one delivery. picnic-api only uses `eta2` when the
- * delivery has no slot, so the narrowed window never reaches its Delivery model; it is read
- * from the raw delivery instead. Failures are non-fatal: the delivery is still returned.
+ * Fetches the raw delivery (`/deliveries/{id}`), or null when the request fails. picnic-api's
+ * Delivery model drops fields the tools need (the narrowed window `eta2`, products that could
+ * not be delivered), so those are read from the raw answer. Failures are non-fatal: the
+ * delivery is still returned without them.
  */
-async function fetchEtaWindow(
+async function fetchRawDelivery(
   client: PicnicClientInstance,
   deliveryId: string,
-): Promise<EtaWindow | null> {
+): Promise<Record<string, unknown> | null> {
   try {
-    const raw = await client.sendRequest<null, Record<string, unknown>>(
-      "GET",
-      `/deliveries/${encodeURIComponent(deliveryId)}`,
+    return (
+      (await client.sendRequest<null, Record<string, unknown>>(
+        "GET",
+        `/deliveries/${encodeURIComponent(deliveryId)}`,
+      )) ?? null
     )
-    return toEtaWindow(raw?.eta2)
   } catch {
     return null
   }
 }
 
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+const asRecords = (value: unknown): Record<string, unknown>[] =>
+  Array.isArray(value)
+    ? value.flatMap((v): Record<string, unknown>[] => {
+        const r = asRecord(v)
+        return r ? [r] : []
+      })
+    : []
+
+/** A product of an order line that Picnic could not deliver, as the app shows it. */
+export type DeliveryFailure = {
+  /** Picnic's reasons, e.g. "PRODUCT_ABSENT", "PRODUCT_LOW_QUALITY", "PRODUCT_NOT_SHIPPED". */
+  reasons: string[]
+  /** How many units of the line failed (the number of failed article/unit ids). */
+  failed_count: number
+  /** The amount not charged for them in cents, when Picnic sends it. */
+  refund?: number
+}
+
+/**
+ * Reads the products Picnic could not deliver from a raw delivery, keyed by order id and then
+ * order line id. Picnic marks them with an `ARTICLE_DELIVERY_FAILURES` decorator on the line,
+ * on its article or in the order's `decorator_overrides` (keyed by line or article id).
+ * picnic-api ignores that decorator, so without this a cancelled product looks delivered.
+ */
+export function readDeliveryFailures(
+  rawDelivery: unknown,
+): Map<string, Map<string, DeliveryFailure>> {
+  const result = new Map<string, Map<string, DeliveryFailure>>()
+  for (const order of asRecords(asRecord(rawDelivery)?.orders)) {
+    const orderId = typeof order.id === "string" ? order.id : null
+    if (!orderId) continue
+    const overrides = asRecord(order.decorator_overrides) ?? {}
+    const lines = new Map<string, DeliveryFailure>()
+
+    for (const line of asRecords(order.items)) {
+      const lineId = line.id == null ? null : String(line.id)
+      if (!lineId) continue
+      const articles = asRecords(line.items)
+      const decorators = [
+        ...asRecords(line.decorators),
+        ...asRecords(overrides[lineId]),
+        ...articles.flatMap((article) => [
+          ...asRecords(article.decorators),
+          ...(article.id == null ? [] : asRecords(overrides[String(article.id)])),
+        ]),
+      ].filter((decorator) => decorator.type === "ARTICLE_DELIVERY_FAILURES")
+
+      const failures = new Map<string, string[]>()
+      const prices = new Map<string, number>()
+      for (const decorator of decorators) {
+        for (const [key, reasons] of Object.entries(asRecord(decorator.failures) ?? {})) {
+          const list = Array.isArray(reasons) ? reasons.filter((r) => typeof r === "string") : []
+          if (list.length) failures.set(key, list)
+        }
+        for (const [key, price] of Object.entries(asRecord(decorator.prices) ?? {})) {
+          if (typeof price === "number" && Number.isFinite(price)) prices.set(key, price)
+        }
+      }
+      if (failures.size === 0) continue
+
+      const refundKeys = [...prices.keys()].filter((key) => failures.has(key))
+      lines.set(lineId, {
+        reasons: [...new Set([...failures.values()].flat())],
+        failed_count: failures.size,
+        ...(refundKeys.length && {
+          refund: refundKeys.reduce((sum, key) => sum + (prices.get(key) ?? 0), 0),
+        }),
+      })
+    }
+    if (lines.size) result.set(orderId, lines)
+  }
+  return result
+}
+
+/**
+ * Adds the products that could not be delivered to a delivery from {@link filterDeliveryData}:
+ * each affected order line gets `delivery_failure`, and the delivery a `not_delivered` summary.
+ */
+export function addDeliveryFailures(
+  delivery: ReturnType<typeof filterDeliveryData>,
+  failures: Map<string, Map<string, DeliveryFailure>>,
+) {
+  if (failures.size === 0) return delivery
+  const notDelivered: Array<{ order_id: string; name: string } & DeliveryFailure> = []
+  const orders = delivery.orders.map((order) => {
+    const orderFailures = failures.get(order.order_id)
+    if (!orderFailures) return order
+    return {
+      ...order,
+      items: order.items.map((item) => {
+        const failure = orderFailures.get(String(item.order_line_id))
+        if (!failure) return item
+        notDelivered.push({
+          order_id: order.order_id,
+          name: item.articles.map((article) => article.name).join(", "),
+          ...failure,
+        })
+        return { ...item, delivery_failure: failure }
+      }),
+    }
+  })
+  return notDelivered.length ? { ...delivery, orders, not_delivered: notDelivered } : delivery
+}
+
+/**
+ * Reads the products a wallet transaction refunded without a replacement (cancelled or missing
+ * products) from the raw transaction. picnic-api only keeps refunds that have substitutions.
+ */
+export function readRefundedItems(rawTransaction: unknown) {
+  const raw = asRecord(rawTransaction) ?? {}
+  const names = new Map<string, string>()
+  for (const line of asRecords(raw.shop_items)) {
+    for (const article of asRecords(line.items)) {
+      if (article.id != null && typeof article.name === "string") {
+        names.set(String(article.id), article.name)
+      }
+    }
+  }
+  return asRecords(raw.article_issue_refunds)
+    .filter((refund) => asRecords(refund.substitutions).length === 0)
+    .map((refund) => {
+      const articleId = refund.article_id == null ? null : String(refund.article_id)
+      return {
+        ...(articleId && { product_id: articleId }),
+        name: (articleId && names.get(articleId)) || null,
+        quantity: typeof refund.quantity === "number" ? refund.quantity : 1,
+        ...(typeof refund.amount === "number" && { refund: refund.amount }),
+        ...(typeof refund.reason === "string" && { reason: refund.reason }),
+      }
+    })
+}
+
 /**
  * Fetches the narrowed delivery windows of the delivery list, keyed by delivery id. Non-fatal,
- * like {@link fetchEtaWindow}.
+ * like {@link fetchRawDelivery}.
  */
 async function fetchEtaWindows(
   client: PicnicClientInstance,
@@ -2242,16 +2380,22 @@ toolRegistry.register({
   description:
     "Get details of a specific delivery. window_start/window_end is the booked slot; " +
     "eta_window_start/eta_window_end is the narrower window the app shows once Picnic has " +
-    "planned the route (absent until then).",
+    "planned the route (absent until then). Products Picnic could not deliver (cancelled, " +
+    "missing or rejected for quality) carry delivery_failure with the reasons and the amount " +
+    "not charged, and are listed in not_delivered.",
   inputSchema: deliveryInputSchema,
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const [delivery, eta] = await Promise.all([
+    const [delivery, raw] = await Promise.all([
       client.delivery.getDelivery(args.deliveryId),
-      fetchEtaWindow(client, args.deliveryId),
+      fetchRawDelivery(client, args.deliveryId),
     ])
-    const { id, status, window_start, window_end, ...rest } = filterDeliveryData(delivery)
+    const eta = toEtaWindow(raw?.eta2)
+    const { id, status, window_start, window_end, ...rest } = addDeliveryFailures(
+      filterDeliveryData(delivery),
+      readDeliveryFailures(raw),
+    )
     return {
       id,
       status,
@@ -2464,13 +2608,26 @@ const walletTransactionDetailsInputSchema = z.object({
 
 toolRegistry.register({
   name: "picnic_get_wallet_transaction_details",
-  description: "Get detailed information about a specific wallet transaction",
+  description:
+    "Get detailed information about a specific wallet transaction. Products refunded without " +
+    "a replacement (cancelled or missing) are listed in refunded_items; substituted ones in " +
+    "substitutions.",
   inputSchema: walletTransactionDetailsInputSchema,
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const details = await client.payment.getWalletTransaction(args.transactionId as string)
-    return details
+    const transactionId = args.transactionId as string
+    const [details, raw] = await Promise.all([
+      client.payment.getWalletTransaction(transactionId),
+      client
+        .sendRequest<
+          null,
+          unknown
+        >("GET", `/wallet/transactions/${encodeURIComponent(transactionId)}`)
+        .catch(() => null),
+    ])
+    const refundedItems = readRefundedItems(raw)
+    return refundedItems.length ? { ...details, refunded_items: refundedItems } : details
   },
 })
 
