@@ -89,6 +89,35 @@ Get product image data.
 - `imageId` (string): The image ID returned by search, cart, or product details
 - `size` (string): Image size (`tiny`, `small`, `medium`, `large`, or `extra-large`)
 
+#### `picnic_get_favorites`
+
+Get the products the customer buys regularly, grouped by aisle.
+
+**Parameters:**
+
+- `aisle_id` (string, optional): List all favorites of one aisle (e.g. `DAIRY`); omit for the overview
+- `limit` / `offset` (number, optional): Pagination when `aisle_id` is set
+
+#### `picnic_get_categories`
+
+Browse the assortment like the app's category tab (picnic-api 5 brings category browsing back).
+
+**Parameters:**
+
+- `category_id` (string, optional): List the subcategories of this category; omit for the top level
+
+**Returns:** Per entry its name, label, `category_id` and what it opens (`subcategories`, `products` or `promotions`).
+
+#### `picnic_get_category_products`
+
+List the products of a category, or only its promotions.
+
+**Parameters:**
+
+- `category_id` (string): A category from `picnic_get_categories`
+- `promotions_only` (boolean, optional): Only the category's promotions
+- `limit` / `offset` (number, optional): Pagination
+
 ### Removed Legacy Product Tools
 
 #### ~~`picnic_get_article`~~ (REMOVED)
@@ -96,10 +125,6 @@ Get product image data.
 **This tool has been removed** because the Picnic API deprecated product detail endpoints. See [GitHub issue #23](https://github.com/MRVDH/picnic-api/issues/23).
 
 **Alternative:** Use `picnic_get_product_details` for product details or `picnic_search` for basic product information (id, name, price, unit).
-
-#### ~~`picnic_get_categories`~~ (REMOVED)
-
-**This tool is not available** because `picnic-api` v4 removed the underlying `getCategories()` function. Category browsing would require a new Fusion page implementation.
 
 ### Shopping Cart Management
 
@@ -128,6 +153,18 @@ Remove a product from the shopping cart.
 #### `picnic_clear_cart`
 
 Clear all items from the shopping cart.
+
+#### `picnic_get_replacements`
+
+Get the products Picnic suggests instead of an unavailable cart product.
+
+**Parameters:**
+
+- `productId` (string): The unavailable cart product
+
+#### `picnic_get_minimum_order_value`
+
+Get the minimum order value in cents for the selected delivery slot. Requires a selected slot.
 
 ### Delivery Management
 
@@ -159,7 +196,7 @@ Get past and current deliveries.
 - `filter` (array of strings, optional): Filter deliveries by status
 - `limit` / `offset` (number, optional): Pagination
 
-**Returns:** ID, status, creation time, delivery window, number of orders and total price in cents per delivery. Use `picnic_get_delivery` for the products.
+**Returns:** ID, status, creation time, delivery window, number of orders and total price in cents per delivery. Upcoming deliveries also get `etaWindowStart`/`etaWindowEnd`, the narrower window the app shows once the route is planned. Use `picnic_get_delivery` for the products.
 
 #### `picnic_get_delivery`
 
@@ -169,11 +206,11 @@ Get details of a specific delivery.
 
 - `deliveryId` (string): The ID of the delivery to get details for
 
-**Returns:** Status, window, totals, returned containers and per order the products (same shape as the cart lines), amount paid and payment type. Amounts in cents.
+**Returns:** Status, booked window, the narrower `eta_window_start`/`eta_window_end` once the route is planned (upcoming deliveries only), totals, returned containers and per order the products (same shape as the cart lines), amount paid and payment type. Amounts in cents.
 
 #### `picnic_get_delivery_position`
 
-Get real-time position data for a delivery.
+Get real-time position data for a delivery that is on its way. Before the driver leaves it returns `inProgress: false` with a hint instead of an error.
 
 **Parameters:**
 
@@ -382,6 +419,16 @@ Remove a recipe's ingredients from the shopping cart.
 **Parameters:**
 
 - `recipe_url_or_id` (string): A Picnic recipe URL or 24-/32-character recipe ID
+
+#### `picnic_update_recipe_portions_in_cart`
+
+Change the number of portions of a recipe in the cart; Picnic scales its ingredients.
+
+**Parameters:**
+
+- `recipe_url_or_id` (string): Recipe URL or ID
+- `portions` (number): The new number of portions
+- `day_offset` (number, optional): Delivery day relative to the selected slot (default 0)
 
 #### `picnic_get_recipe_ingredients`
 

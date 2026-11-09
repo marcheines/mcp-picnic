@@ -161,6 +161,68 @@ export function filterDeliveryData(delivery: PicnicDelivery) {
   }
 }
 
+type PicnicClientInstance = ReturnType<typeof getPicnicClient>
+
+/** The narrowed delivery window Picnic shows in the app shortly before delivery. */
+export type EtaWindow = { eta_window_start: string; eta_window_end: string }
+
+/**
+ * Reads Picnic's `eta2` field (`{ start, end }`) into an {@link EtaWindow}, or null when it is
+ * missing or incomplete.
+ */
+export function toEtaWindow(eta2: unknown): EtaWindow | null {
+  if (!eta2 || typeof eta2 !== "object") return null
+  const { start, end } = eta2 as Record<string, unknown>
+  if (typeof start !== "string" || !start || typeof end !== "string" || !end) return null
+  return { eta_window_start: start, eta_window_end: end }
+}
+
+/**
+ * Fetches the narrowed delivery window of one delivery. picnic-api only uses `eta2` when the
+ * delivery has no slot, so the narrowed window never reaches its Delivery model; it is read
+ * from the raw delivery instead. Failures are non-fatal: the delivery is still returned.
+ */
+async function fetchEtaWindow(
+  client: PicnicClientInstance,
+  deliveryId: string,
+): Promise<EtaWindow | null> {
+  try {
+    const raw = await client.sendRequest<null, Record<string, unknown>>(
+      "GET",
+      `/deliveries/${encodeURIComponent(deliveryId)}`,
+    )
+    return toEtaWindow(raw?.eta2)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Fetches the narrowed delivery windows of the delivery list, keyed by delivery id. Non-fatal,
+ * like {@link fetchEtaWindow}.
+ */
+async function fetchEtaWindows(
+  client: PicnicClientInstance,
+  filter: PicnicDeliveryStatus[],
+): Promise<Map<string, EtaWindow>> {
+  const windows = new Map<string, EtaWindow>()
+  try {
+    const raw = await client.sendRequest<PicnicDeliveryStatus[], unknown>(
+      "POST",
+      "/deliveries/summary",
+      filter,
+    )
+    for (const entry of Array.isArray(raw) ? raw : []) {
+      const record = entry as Record<string, unknown>
+      const window = toEtaWindow(record?.eta2)
+      if (window && typeof record.delivery_id === "string") windows.set(record.delivery_id, window)
+    }
+  } catch {
+    // Without the raw list the deliveries are still returned, just without the narrowed window.
+  }
+  return windows
+}
+
 /**
  * Reduces the picnic-api 5 cart model to what an LLM needs.
  *
@@ -296,6 +358,14 @@ function toPromotionProduct(tile: PicnicProductTile, section?: string) {
     ...(tile.isUnavailable && { unavailable: true }),
     ...(tile.imageId && { image_id: tile.imageId }),
   }
+}
+
+/**
+ * Reduces any product tile (favorites, categories, replacements) to what an LLM needs; the same
+ * shape as the promotion products, with a promotion_label only when the tile has one.
+ */
+function toProductTile(tile: PicnicProductTile, section?: string) {
+  return toPromotionProduct(tile, section)
 }
 
 const promotionsInputSchema = z.object({
@@ -447,6 +517,196 @@ toolRegistry.register({
 
 // Note: picnic_get_article tool removed - endpoint deprecated (GitHub issue #23)
 // Use picnic_search instead for basic product information
+
+// Favorites tool
+const favoritesInputSchema = z.object({
+  aisle_id: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe(
+      "An aisle id from a previous call without aisle_id (e.g. 'DAIRY') to list all " +
+        "favorites in that aisle. Omit for an overview of all aisles.",
+    ),
+  limit: z
+    .number()
+    .min(1)
+    .max(100)
+    .default(50)
+    .describe("With aisle_id: maximum number of products to return (1-100, default: 50)"),
+  offset: z
+    .number()
+    .min(0)
+    .default(0)
+    .describe("With aisle_id: number of products to skip for pagination (default: 0)"),
+})
+
+toolRegistry.register({
+  name: "picnic_get_favorites",
+  description:
+    "Get the products the customer buys regularly ('Favoriten'), grouped by aisle in the " +
+    "app's order. Without aisle_id it returns every aisle with the products the app shows " +
+    "first; aisles with complete=false have more, which aisle_id lists. Prices in cents.",
+  inputSchema: favoritesInputSchema,
+  annotations: { readOnlyHint: true, openWorldHint: true },
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    if (args.aisle_id) {
+      const products = await client.catalog.getFavoritesInAisle(args.aisle_id)
+      const startIndex = args.offset || 0
+      const limit = args.limit || 50
+      const page = products.slice(startIndex, startIndex + limit).map((tile) => toProductTile(tile))
+      return {
+        aisle_id: args.aisle_id,
+        products: page,
+        pagination: {
+          offset: startIndex,
+          limit,
+          returned: page.length,
+          total: products.length,
+          hasMore: startIndex + limit < products.length,
+        },
+      }
+    }
+    const favorites = await client.catalog.getFavorites()
+    return {
+      aisles: (favorites.aisles ?? []).map((aisle) => ({
+        aisle_id: aisle.id,
+        title: aisle.title,
+        complete: aisle.complete,
+        products: (aisle.products ?? []).map((tile) => toProductTile(tile)),
+      })),
+    }
+  },
+})
+
+// Category tools
+type PicnicCategoryLink = PicnicClient.Types.catalog.CategoryLink
+
+/** Reduces a category link to its name, label and what it opens. */
+function toCategoryLink(link: PicnicCategoryLink) {
+  const target = link.target
+  return {
+    name: link.name,
+    ...(link.label && { label: link.label }),
+    // "subcategories": open with picnic_get_categories; "products"/"promotions": with
+    // picnic_get_category_products (promotions_only for "promotions").
+    opens: target.type,
+    ...("categoryId" in target && { category_id: target.categoryId }),
+  }
+}
+
+const categoriesInputSchema = z.object({
+  category_id: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe(
+      "A category_id whose link opens 'subcategories', to list them. Omit for the top-level " +
+        "category tree.",
+    ),
+})
+
+toolRegistry.register({
+  name: "picnic_get_categories",
+  description:
+    "Browse Picnic's assortment like the app's category tab. Without category_id it returns " +
+    "the top-level categories; with one, its subcategories. Each entry says what it opens: " +
+    "'subcategories' (call this tool again), 'products' or 'promotions' (call " +
+    "picnic_get_category_products).",
+  inputSchema: categoriesInputSchema,
+  annotations: { readOnlyHint: true, openWorldHint: true },
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    if (args.category_id) {
+      const subcategories = await client.catalog.getSubcategories(args.category_id)
+      return {
+        category_id: subcategories.categoryId,
+        title: subcategories.title,
+        categories: (subcategories.links ?? [])
+          .filter((link) => link.target.type !== "page")
+          .map(toCategoryLink),
+      }
+    }
+    const sections = await client.catalog.getCategories()
+    return {
+      sections: sections.map((section) => ({
+        ...(section.title && { title: section.title }),
+        categories: (section.links ?? [])
+          .filter((link) => link.target.type !== "page")
+          .map(toCategoryLink),
+      })),
+    }
+  },
+})
+
+const categoryProductsInputSchema = z.object({
+  category_id: z
+    .string()
+    .trim()
+    .min(1)
+    .describe("A category_id from picnic_get_categories whose link opens products or promotions"),
+  promotions_only: z
+    .boolean()
+    .default(false)
+    .describe("Only the category's promotions (for links that open 'promotions')"),
+  limit: z
+    .number()
+    .min(1)
+    .max(100)
+    .default(25)
+    .describe("Maximum number of products to return (1-100, default: 25)"),
+  offset: z
+    .number()
+    .min(0)
+    .default(0)
+    .describe("Number of products to skip for pagination (default: 0)"),
+})
+
+toolRegistry.register({
+  name: "picnic_get_category_products",
+  description:
+    "List the products of a category from picnic_get_categories, or only its promotions. " +
+    "Products appear once, with the section they are listed under. Prices in cents.",
+  inputSchema: categoryProductsInputSchema,
+  annotations: { readOnlyHint: true, openWorldHint: true },
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const result = args.promotions_only
+      ? await client.catalog.getCategoryPromotions(args.category_id)
+      : await client.catalog.getCategoryProducts(args.category_id)
+    const seen = new Set<string>()
+    const all = (result.results?.sections ?? []).flatMap((section) =>
+      (section.products ?? [])
+        .filter((tile) => {
+          if (seen.has(tile.id)) return false
+          seen.add(tile.id)
+          return true
+        })
+        .map((tile) => toProductTile(tile, section.title ?? undefined)),
+    )
+    const startIndex = args.offset || 0
+    const limit = args.limit || 25
+    const page = all.slice(startIndex, startIndex + limit)
+    return {
+      category_id: result.categoryId,
+      title: result.title,
+      products: page,
+      pagination: {
+        offset: startIndex,
+        limit,
+        returned: page.length,
+        total: all.length,
+        hasMore: startIndex + limit < all.length,
+      },
+    }
+  },
+})
 
 // Get product details tool
 const productDetailsInputSchema = z.object({
@@ -1500,6 +1760,40 @@ toolRegistry.register({
   },
 })
 
+const recipePortionsInCartInputSchema = recipeRefInputSchema.extend({
+  portions: z.number().int().min(1).max(20).describe("The new number of portions"),
+  day_offset: z
+    .number()
+    .int()
+    .min(0)
+    .default(0)
+    .describe(
+      "Which delivery day the recipe is planned for, relative to the selected slot " +
+        "(default: 0, the selected delivery)",
+    ),
+})
+
+toolRegistry.register({
+  name: "picnic_update_recipe_portions_in_cart",
+  description:
+    "Change the number of portions of a recipe that is already in the cart; Picnic scales " +
+    "its ingredients. Call picnic_get_cart afterwards to see the new quantities.",
+  inputSchema: recipePortionsInCartInputSchema,
+  annotations: CART_MUTATION_ANNOTATIONS,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = await resolveRecipeId(args.recipe_url_or_id)
+    await mutateCart("Changing the recipe's portions", () =>
+      client.recipe.updateRecipePortionsInCart(recipeId, {
+        dayOffset: args.day_offset ?? 0,
+        portions: args.portions,
+      }),
+    )
+    return { message: `Recipe set to ${args.portions} portion(s)`, recipeId }
+  },
+})
+
 // Recipe meal-planning tools
 const recipeIngredientsInputSchema = z.object({
   recipe_url_or_id: z
@@ -1734,6 +2028,61 @@ toolRegistry.register({
   },
 })
 
+// Replacements for unavailable cart products
+const replacementsInputSchema = z.object({
+  productId: z
+    .string()
+    .trim()
+    .min(1)
+    .describe("The id of a cart product marked unavailable in picnic_get_cart"),
+})
+
+toolRegistry.register({
+  name: "picnic_get_replacements",
+  description:
+    "Get the products Picnic suggests instead of a cart product that can't be delivered " +
+    "(unavailable in picnic_get_cart), in the app's order. Swap with picnic_remove_from_cart " +
+    "and picnic_add_to_cart. Prices in cents.",
+  inputSchema: replacementsInputSchema,
+  annotations: { readOnlyHint: true, openWorldHint: true },
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const result = await client.cart.getReplacements(args.productId)
+    return {
+      product_id: result.productId,
+      ...(result.reason && { reason: result.reason }),
+      replacements: (result.replacements ?? []).map((tile) => toProductTile(tile)),
+    }
+  },
+})
+
+// Minimum order value tool
+toolRegistry.register({
+  name: "picnic_get_minimum_order_value",
+  description:
+    "Get the minimum order value (in cents) for the currently selected delivery slot. " +
+    "A slot must be selected first (picnic_set_delivery_slot).",
+  inputSchema: z.object({}),
+  annotations: { readOnlyHint: true, openWorldHint: true },
+  handler: async () => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    try {
+      return await client.cart.getMinimumOrderValue()
+    } catch (error) {
+      // Picnic answers with a 500 when no slot is selected.
+      if (PicnicClient.isPicnicApiError(error) && error.status === 500) {
+        throw new Error(
+          "Picnic has no minimum order value without a selected delivery slot. Select one " +
+            "with picnic_set_delivery_slot first.",
+        )
+      }
+      throw error
+    }
+  },
+})
+
 // Get delivery slots tool
 const deliverySlotsInputSchema = z.object({
   available_only: z
@@ -1834,7 +2183,10 @@ const deliveriesInputSchema = z.object({
 
 toolRegistry.register({
   name: "picnic_get_deliveries",
-  description: "Get past and current deliveries with pagination",
+  description:
+    "Get past and current deliveries with pagination. windowStart/windowEnd is the booked " +
+    "slot; for upcoming deliveries etaWindowStart/etaWindowEnd is the narrower window the " +
+    "app shows once Picnic has planned the route (absent until then).",
   inputSchema: deliveriesInputSchema,
   handler: async (args) => {
     await ensureClientInitialized()
@@ -1848,17 +2200,24 @@ toolRegistry.register({
     const limit = args.limit || 10
     // Picnic's summary leaves the item count at 0, so it is left out; picnic_get_delivery has
     // the products.
-    const paginatedDeliveries = allDeliveries
-      .slice(startIndex, startIndex + limit)
-      .map((delivery) => ({
+    const page = allDeliveries.slice(startIndex, startIndex + limit)
+    // Only deliveries that are still coming can have a narrowed window.
+    const etaWindows = page.some((delivery) => delivery.status === "CURRENT")
+      ? await fetchEtaWindows(client, (args.filter ?? []) as PicnicDeliveryStatus[])
+      : new Map<string, EtaWindow>()
+    const paginatedDeliveries = page.map((delivery) => {
+      const eta = delivery.status === "CURRENT" ? etaWindows.get(delivery.id) : undefined
+      return {
         id: delivery.id,
         status: delivery.status,
         creationTime: delivery.creationTime,
         windowStart: delivery.windowStart,
         windowEnd: delivery.windowEnd,
+        ...(eta && { etaWindowStart: eta.eta_window_start, etaWindowEnd: eta.eta_window_end }),
         orderCount: delivery.orderCount,
         totalPrice: delivery.totalPrice,
-      }))
+      }
+    })
 
     return {
       deliveries: paginatedDeliveries,
@@ -1880,26 +2239,61 @@ const deliveryInputSchema = z.object({
 
 toolRegistry.register({
   name: "picnic_get_delivery",
-  description: "Get details of a specific delivery",
+  description:
+    "Get details of a specific delivery. window_start/window_end is the booked slot; " +
+    "eta_window_start/eta_window_end is the narrower window the app shows once Picnic has " +
+    "planned the route (absent until then).",
   inputSchema: deliveryInputSchema,
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const delivery = await client.delivery.getDelivery(args.deliveryId)
-    return filterDeliveryData(delivery)
+    const [delivery, eta] = await Promise.all([
+      client.delivery.getDelivery(args.deliveryId),
+      fetchEtaWindow(client, args.deliveryId),
+    ])
+    const { id, status, window_start, window_end, ...rest } = filterDeliveryData(delivery)
+    return {
+      id,
+      status,
+      window_start,
+      window_end,
+      ...(status === "CURRENT" && eta),
+      ...rest,
+    }
   },
 })
+
+/** True for the parse error picnic-api throws when Picnic answers with an empty body. */
+function isEmptyResponseError(error: unknown): boolean {
+  return error instanceof SyntaxError && /JSON/i.test(error.message)
+}
 
 // Get delivery position tool
 toolRegistry.register({
   name: "picnic_get_delivery_position",
-  description: "Get real-time position data for a delivery",
+  description:
+    "Get real-time position data for a delivery that is on its way: expected arrival (eta, " +
+    "epoch ms) and its window. Before the driver leaves Picnic has no position; then " +
+    "inProgress is false — use picnic_get_delivery for the planned window.",
   inputSchema: deliveryInputSchema,
+  annotations: { readOnlyHint: true, openWorldHint: true },
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const position = await client.delivery.getDeliveryPosition(args.deliveryId)
-    return position
+    try {
+      return await client.delivery.getDeliveryPosition(args.deliveryId)
+    } catch (error) {
+      const notFound = PicnicClient.isPicnicApiError(error) && error.status === 404
+      if (isEmptyResponseError(error) || notFound) {
+        return {
+          inProgress: false,
+          message:
+            `No live position for delivery ${args.deliveryId} yet. Picnic only has one while ` +
+            "the driver is on the way; picnic_get_delivery has the planned delivery window.",
+        }
+      }
+      throw error
+    }
   },
 })
 

@@ -9,12 +9,15 @@ const mocks = vi.hoisted(() => ({
   getDeliverySlots: vi.fn(),
   getDeliverySummaries: vi.fn(),
   getDelivery: vi.fn(),
+  getDeliveryPosition: vi.fn(),
+  sendRequest: vi.fn(),
 }))
 
 vi.mock("../../../src/utils/picnic-client.js", () => ({
   getPicnicClient: () => ({
-    sendRequest: vi.fn(),
+    sendRequest: mocks.sendRequest,
     delivery: {
+      getDeliveryPosition: mocks.getDeliveryPosition,
       getDeliveryRoute: mocks.getDeliveryRoute,
       getDeliverySummaries: mocks.getDeliverySummaries,
       getDelivery: mocks.getDelivery,
@@ -297,5 +300,151 @@ describe("delivery and order tools", () => {
         },
       ],
     })
+  })
+})
+
+describe("narrowed delivery window (eta2)", () => {
+  const slotStart = "2026-11-09T15:00:00.000+01:00"
+  const slotEnd = "2026-11-09T17:30:00.000+01:00"
+  const etaStart = "2026-11-09T15:40:00.000+01:00"
+  const etaEnd = "2026-11-09T16:00:00.000+01:00"
+
+  function currentDelivery() {
+    return {
+      id: "d1",
+      status: "CURRENT",
+      creationTime: "2026-11-07T18:56:26.416+01:00",
+      windowStart: slotStart,
+      windowEnd: slotEnd,
+      orders: [],
+      returnedContainers: [],
+      totalPrice: 5174,
+      totalCount: 25,
+      discount: 0,
+      promotionSavings: 0,
+      membershipSavings: 0,
+      deposits: [],
+      depositTotal: 0,
+      fees: [],
+      cancellable: false,
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.initializePicnicClient.mockResolvedValue(undefined)
+  })
+
+  it("adds the window from the raw delivery's eta2 to picnic_get_delivery", async () => {
+    mocks.getDelivery.mockResolvedValue(currentDelivery())
+    mocks.sendRequest.mockResolvedValue({ eta2: { start: etaStart, end: etaEnd } })
+    const toolRegistry = await loadTools()
+
+    const payload = parseToolResult(
+      await toolRegistry.executeTool("picnic_get_delivery", { deliveryId: "d1" }),
+    )
+
+    expect(mocks.sendRequest).toHaveBeenCalledWith("GET", "/deliveries/d1")
+    expect(payload).toMatchObject({
+      window_start: slotStart,
+      window_end: slotEnd,
+      eta_window_start: etaStart,
+      eta_window_end: etaEnd,
+    })
+  })
+
+  it("still returns the delivery when the raw request fails or has no eta2", async () => {
+    mocks.getDelivery.mockResolvedValue(currentDelivery())
+    mocks.sendRequest.mockRejectedValueOnce(new Error("boom"))
+    const toolRegistry = await loadTools()
+
+    const failed = parseToolResult(
+      await toolRegistry.executeTool("picnic_get_delivery", { deliveryId: "d1" }),
+    )
+    expect(failed.id).toBe("d1")
+    expect(failed).not.toHaveProperty("eta_window_start")
+
+    mocks.sendRequest.mockResolvedValueOnce({ eta2: null })
+    const missing = parseToolResult(
+      await toolRegistry.executeTool("picnic_get_delivery", { deliveryId: "d1" }),
+    )
+    expect(missing).not.toHaveProperty("eta_window_start")
+  })
+
+  it("adds the window to current deliveries in picnic_get_deliveries only", async () => {
+    mocks.getDeliverySummaries.mockResolvedValue([
+      {
+        id: "d1",
+        status: "CURRENT",
+        creationTime: "2026-11-07T18:56:26.416+01:00",
+        windowStart: slotStart,
+        windowEnd: slotEnd,
+        orderCount: 3,
+        totalPrice: 5174,
+        itemCount: 0,
+      },
+      {
+        id: "d0",
+        status: "COMPLETED",
+        creationTime: "2026-10-26T18:15:12.539+01:00",
+        windowStart: "2026-10-29T19:00:00.000+01:00",
+        windowEnd: "2026-10-29T22:00:00.000+01:00",
+        orderCount: 3,
+        totalPrice: 6876,
+        itemCount: 0,
+      },
+    ])
+    mocks.sendRequest.mockResolvedValue([
+      { delivery_id: "d1", eta2: { start: etaStart, end: etaEnd } },
+      { delivery_id: "d0", eta2: { start: "x", end: "y" } },
+    ])
+    const toolRegistry = await loadTools()
+
+    const payload = parseToolResult(await toolRegistry.executeTool("picnic_get_deliveries", {}))
+
+    expect(mocks.sendRequest).toHaveBeenCalledWith("POST", "/deliveries/summary", [])
+    expect(payload.deliveries[0]).toMatchObject({ etaWindowStart: etaStart, etaWindowEnd: etaEnd })
+    expect(payload.deliveries[1]).not.toHaveProperty("etaWindowStart")
+  })
+
+  it("skips the extra request when no delivery on the page is current", async () => {
+    mocks.getDeliverySummaries.mockResolvedValue([
+      {
+        id: "d0",
+        status: "COMPLETED",
+        creationTime: "2026-10-26T18:15:12.539+01:00",
+        windowStart: null,
+        windowEnd: null,
+        orderCount: 1,
+        totalPrice: 100,
+        itemCount: 0,
+      },
+    ])
+    const toolRegistry = await loadTools()
+
+    await toolRegistry.executeTool("picnic_get_deliveries", {})
+
+    expect(mocks.sendRequest).not.toHaveBeenCalled()
+  })
+
+  it("explains a missing live position instead of failing on Picnic's empty answer", async () => {
+    mocks.getDeliveryPosition.mockRejectedValue(new SyntaxError("Unexpected end of JSON input"))
+    const toolRegistry = await loadTools()
+
+    const payload = parseToolResult(
+      await toolRegistry.executeTool("picnic_get_delivery_position", { deliveryId: "d1" }),
+    )
+
+    expect(payload).toMatchObject({ inProgress: false })
+    expect(payload.message).toMatch(/picnic_get_delivery/)
+  })
+
+  it("passes on other position errors", async () => {
+    mocks.getDeliveryPosition.mockRejectedValue(new Error("network down"))
+    const toolRegistry = await loadTools()
+
+    await expect(
+      toolRegistry.executeTool("picnic_get_delivery_position", { deliveryId: "d1" }),
+    ).rejects.toThrow(/network down/)
   })
 })
